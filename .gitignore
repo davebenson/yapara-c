@@ -1,0 +1,33 @@
+# autotools output
+/build-aux/
+/m4/
+/autom4te.cache/
+/configure
+/aclocal.m4
+Makefile
+Makefile.in
+/config.log
+/config.status
+/stamp-h1
+*.o
+*.a
+.deps/
+.dirstamp
+
+# test-suite output
+*.log
+*.trs
+
+# programs
+/src/yapara
+/src/test-shell
+/src/test-child
+/src/test-ui
+*.dSYM/
+
+# dist tarballs
+/yapara-*.tar.*
+
+# editor and tool backups
+*~
+*.swp

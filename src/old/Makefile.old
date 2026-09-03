@@ -1,0 +1,56 @@
+
+# -Wno-unused-parameter: a vtable implementation takes the whole
+# signature whether or not it uses every argument.
+CCFLAGS = -W -Wall -Wno-unused -Wno-unused-parameter -g -O2
+UV_FLAGS = `pkg-config --libs --cflags libuv`
+
+LIB_C_FILES = \
+yc-alloc.c \
+yc-buffer.c \
+yc-child.c \
+yc-cmdline.c \
+yc-common.c \
+yc-shell.c \
+yc-ui.c \
+yc-ui-plain.c \
+yc-ui-prefix.c \
+yc-ui-headless-jobs.c
+
+# The tests drive the library directly, so they need neither the
+# command-line parser nor the buffer it is built on.
+TEST_LIB_C_FILES = \
+yc-alloc.c \
+yc-child.c \
+yc-common.c \
+yc-shell.c \
+yc-ui.c \
+yc-ui-plain.c \
+yc-ui-prefix.c \
+yc-ui-headless-jobs.c
+
+TEST_PROGRAMS = test-shell test-child test-ui
+
+all: yapara
+
+yapara: yapara-main.c $(LIB_C_FILES)
+	cc $(CCFLAGS) -o $@ $^ $(UV_FLAGS)
+
+test-shell: test-shell.c $(TEST_LIB_C_FILES)
+	cc $(CCFLAGS) -o $@ $^ $(UV_FLAGS)
+
+test-child: test-child.c $(TEST_LIB_C_FILES)
+	cc $(CCFLAGS) -o $@ $^ $(UV_FLAGS)
+
+test-ui: test-ui.c $(TEST_LIB_C_FILES)
+	cc $(CCFLAGS) -o $@ $^ $(UV_FLAGS)
+
+check: $(TEST_PROGRAMS)
+	@for t in $(TEST_PROGRAMS); do \
+	  echo "--- $$t"; ./$$t || exit 1; \
+	done
+
+clean:
+	rm -f yapara $(TEST_PROGRAMS)
+	rm -rf *.dSYM
+
+.PHONY: all check clean

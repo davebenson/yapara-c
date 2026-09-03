@@ -43,7 +43,15 @@ plain_job_line (YcUI *ui, YcUIJob *job, int child_fd,
 
   plain->n_lines++;
   pjob->n_lines++;
-  printf ("%s\n", line);
+
+  /* Both are "" unless colour is on.  With no tag to carry it, the
+     colour is the only thing saying which job a line came from. */
+  fputs (yc_ui_job_color (ui, job), stdout);
+  /* fwrite, not %s: a child may legitimately write a NUL byte, and
+     printf would end the line there. */
+  fwrite (line, 1, len, stdout);
+  fputs (yc_ui_color_reset (ui), stdout);
+  putchar ('\n');
 }
 
 static void
@@ -61,11 +69,13 @@ plain_job_ended (YcUI *ui, YcUIJob *job)
   yc_ui_job_index_string (ui, job, index, sizeof (index));
 
   if (job->status == YC_CHILD_STATUS_KILLED)
-    fprintf (stderr, "[%s] %s: killed by signal %d\n",
-             index, job->cmdline, job->status_value);
+    fprintf (stderr, "%s[%s] %s: killed by signal %d%s\n",
+             yc_ui_job_color (ui, job), index, job->cmdline,
+             job->status_value, yc_ui_color_reset (ui));
   else if (job->status_value != 0)
-    fprintf (stderr, "[%s] %s: exited with status %d\n",
-             index, job->cmdline, job->status_value);
+    fprintf (stderr, "%s[%s] %s: exited with status %d%s\n",
+             yc_ui_job_color (ui, job), index, job->cmdline,
+             job->status_value, yc_ui_color_reset (ui));
 
   yc_free (pjob);
   job->ui_data = NULL;
@@ -86,7 +96,8 @@ plain_all_done (YcUI *ui)
 
 const YcUIFuncs yc_ui_plain = {
   "plain",
-  "print output as it arrives, undecorated",
+  "merge every job's output into one stream, a line at a time, "
+  "never splitting a line",
   sizeof (PlainUI),
   0,                            /* flags */
   NULL,                         /* init */

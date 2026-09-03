@@ -31,8 +31,12 @@ prefix_job_line (YcUI *ui, YcUIJob *job, int child_fd,
 {
   char index[YC_UI_INDEX_BUF_SIZE];
 
-  printf ("%s%c: ", yc_ui_job_index_string (ui, job, index, sizeof (index)),
-          STREAM_CHAR (child_fd));
+  /* Only the tag is tinted: the payload is the child's own text, which
+     may already contain escapes of its own, and colouring it would
+     also mean wrapping bytes that need not be text at all. */
+  printf ("%s%s%c:%s ", yc_ui_job_color (ui, job),
+          yc_ui_job_index_string (ui, job, index, sizeof (index)),
+          STREAM_CHAR (child_fd), yc_ui_color_reset (ui));
   /* fwrite rather than %s: a child is entitled to write a NUL byte,
      and printf would silently end the line there. */
   fwrite (line, 1, len, stdout);
@@ -54,11 +58,13 @@ prefix_job_ended (YcUI *ui, YcUIJob *job)
   yc_ui_job_index_string (ui, job, index, sizeof (index));
 
   if (job->status == YC_CHILD_STATUS_KILLED)
-    fprintf (stderr, "%s%c: killed by signal %d\n",
-             index, NOTE_CHAR, job->status_value);
+    fprintf (stderr, "%s%s%c:%s killed by signal %d\n",
+             yc_ui_job_color (ui, job), index, NOTE_CHAR,
+             yc_ui_color_reset (ui), job->status_value);
   else
-    fprintf (stderr, "%s%c: exited with status %d\n",
-             index, NOTE_CHAR, job->status_value);
+    fprintf (stderr, "%s%s%c:%s exited with status %d\n",
+             yc_ui_job_color (ui, job), index, NOTE_CHAR,
+             yc_ui_color_reset (ui), job->status_value);
 }
 
 static void

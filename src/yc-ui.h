@@ -60,12 +60,23 @@ typedef struct {
   bool zero_pad;               /* pad with '0' rather than ' ' */
 } YcUIIndexFormat;
 
+typedef enum
+{
+  YC_UI_COLOR_AUTO,            /* a terminal, and NO_COLOR unset */
+  YC_UI_COLOR_ALWAYS,
+  YC_UI_COLOR_NEVER
+} YcUIColorWhen;
+
 typedef struct {
   char *key, *value;
 } YcUIOptionKV;
 
 struct YcUIOptions {
   YcUIIndexFormat index_format;
+
+  /* Whether to tint output by job.  Shared for the same reason as the
+     index format: --colorize should mean one thing across backends. */
+  YcUIColorWhen color;
 
   /* Where a UI that writes files should put them.  Shared, so that
      --out-dir means the same thing to every such backend.  NULL if it
@@ -129,6 +140,16 @@ const char *yc_ui_format_index_for_filename (const YcUIOptions *options,
 bool yc_ui_options_ensure_out_dir (const YcUIOptions *options,
                                    char **error_message);
 
+/* Resolves YC_UI_COLOR_AUTO: a terminal on stdout, NO_COLOR unset,
+ * TERM not "dumb".  yc_ui_new() calls this once and caches the answer
+ * in ui->colorize. */
+bool yc_ui_options_colorize (const YcUIOptions *options);
+
+/* Parses auto/always/never, and the booleans yc_parse_boolean knows,
+ * so --colorize=yes and --colorize=no also work.  NULL (the option
+ * given with no argument) means ALWAYS. */
+bool yc_ui_parse_color_when (const char *text, YcUIColorWhen *out);
+
 struct YcUIJob {
   uint64_t index;                 /* 0-based, monotonic, stable */
   const char *cmdline;            /* owned by the job */
@@ -190,6 +211,10 @@ struct YcUI {
      caller, who must keep it alive as long as the UI. */
   const YcUIOptions *options;
 
+  /* options->color resolved once at construction, so a UI need not
+     re-check isatty() for every line. */
+  bool colorize;
+
   /* Jobs currently running, in the order they started -- stable, so a
      selection pane does not jump around.  Finished jobs are gone from
      here by the time job_ended() returns. */
@@ -228,6 +253,17 @@ void  yc_ui_free (YcUI *ui);
 /* What a UI calls to render one of its own job's indices. */
 const char *yc_ui_job_index_string (YcUI *ui, YcUIJob *job,
                                     char *buf, size_t buf_size);
+
+/* An SGR escape identifying this job, or "" when colour is off -- so
+ * printing it unconditionally is always safe.  The colour is chosen
+ * from the job index rather than at random: it is then stable across
+ * reruns, and consecutive jobs are guaranteed to differ, which random
+ * choice cannot promise.
+ *
+ * The colour identifies the JOB, not the stream.  Use --ui=prefix if
+ * you need to tell stdout from stderr. */
+const char *yc_ui_job_color   (YcUI *ui, YcUIJob *job);
+const char *yc_ui_color_reset (YcUI *ui);
 
 /* Assigns the next job index, points stdout/stderr at pipes if this UI
  * consumes output, installs the callbacks that turn reads into UI

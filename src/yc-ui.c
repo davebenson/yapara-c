@@ -34,6 +34,7 @@ yc_now_micros (void)
 
 static const YcUIOptions default_options = {
   { YC_UI_INDEX_DECIMAL, 0, false },
+  YC_UI_COLOR_AUTO,              /* color */
   NULL,                          /* out_dir */
   0, NULL                        /* extra */
 };
@@ -254,6 +255,90 @@ make_directories (const char *path, char **error_message)
   return ok;
 }
 
+/* --- colour --- */
+
+/* Deliberately excludes black, white and bright-black: each of those
+   is invisible against one common terminal background or the other.
+   Indexing by job number rather than choosing at random means
+   consecutive jobs never collide, and a rerun looks the same. */
+static const char *const job_colors[] = {
+  "\033[31m", "\033[32m", "\033[33m", "\033[34m", "\033[35m", "\033[36m",
+  "\033[91m", "\033[92m", "\033[93m", "\033[94m", "\033[95m", "\033[96m"
+};
+#define N_JOB_COLORS  (sizeof (job_colors) / sizeof (job_colors[0]))
+#define COLOR_RESET   "\033[0m"
+
+bool
+yc_ui_parse_color_when (const char *text, YcUIColorWhen *out)
+{
+  bool as_boolean;
+
+  /* '--colorize' with no argument. */
+  if (text == NULL)
+    {
+      *out = YC_UI_COLOR_ALWAYS;
+      return true;
+    }
+  if (strcmp (text, "auto") == 0)
+    {
+      *out = YC_UI_COLOR_AUTO;
+      return true;
+    }
+  if (strcmp (text, "always") == 0)
+    {
+      *out = YC_UI_COLOR_ALWAYS;
+      return true;
+    }
+  if (strcmp (text, "never") == 0)
+    {
+      *out = YC_UI_COLOR_NEVER;
+      return true;
+    }
+  /* Anything yc_parse_boolean understands, so --colorize=no works. */
+  if (yc_parse_boolean (text, &as_boolean))
+    {
+      *out = as_boolean ? YC_UI_COLOR_ALWAYS : YC_UI_COLOR_NEVER;
+      return true;
+    }
+  return false;
+}
+
+bool
+yc_ui_options_colorize (const YcUIOptions *options)
+{
+  const char *no_color, *term;
+
+  if (options->color == YC_UI_COLOR_ALWAYS)
+    return true;
+  if (options->color == YC_UI_COLOR_NEVER)
+    return false;
+
+  /* AUTO.  Escapes in a file or a pipe are noise, and NO_COLOR is the
+     agreed way to say "never" once and for all (no-color.org: set and
+     non-empty). */
+  no_color = getenv ("NO_COLOR");
+  if (no_color != NULL && no_color[0] != 0)
+    return false;
+  term = getenv ("TERM");
+  if (term != NULL && strcmp (term, "dumb") == 0)
+    return false;
+  return isatty (STDOUT_FILENO) != 0;
+}
+
+const char *
+yc_ui_job_color (YcUI *ui, YcUIJob *job)
+{
+  if (!ui->colorize)
+    return "";
+  return job_colors[job->index % N_JOB_COLORS];
+}
+
+const char *
+yc_ui_color_reset (YcUI *ui)
+{
+  return ui->colorize ? COLOR_RESET : "";
+}
+
 bool
 yc_ui_options_ensure_out_dir (const YcUIOptions *options,
                               char **error_message)
@@ -281,6 +366,7 @@ static size_t n_registered, registry_alloced;
 extern const YcUIFuncs yc_ui_plain;
 extern const YcUIFuncs yc_ui_prefix;
 extern const YcUIFuncs yc_ui_headless_jobs;
+extern const YcUIFuncs yc_ui_passthrough;
 
 static void
 register_builtins_once (void)
@@ -292,6 +378,7 @@ register_builtins_once (void)
   yc_ui_register (&yc_ui_plain);
   yc_ui_register (&yc_ui_prefix);
   yc_ui_register (&yc_ui_headless_jobs);
+  yc_ui_register (&yc_ui_passthrough);
 }
 
 void
@@ -361,6 +448,7 @@ yc_ui_new (const YcUIFuncs *funcs,
   ui->funcs = funcs;
   ui->loop = loop;
   ui->options = options != NULL ? options : &default_options;
+  ui->colorize = yc_ui_options_colorize (ui->options);
 
   if (funcs->init != NULL && !funcs->init (ui, error_message))
     {

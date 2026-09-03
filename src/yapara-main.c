@@ -132,6 +132,21 @@ static YC_CMDLINE_CALLBACK_DECLARE (handle_ui_option)
   return yc_ui_options_parse (ui_options, arg_value, error);
 }
 
+/* A callback rather than a boolean because the option is three-valued:
+   given ('-c'), given as off ('--colorize=never'), and absent -- which
+   means decide from whether stdout is a terminal. */
+static YC_CMDLINE_CALLBACK_DECLARE (handle_colorize)
+{
+  YcUIOptions *ui_options = callback_data;
+
+  if (!yc_ui_parse_color_when (arg_value, &ui_options->color))
+    {
+      *error = yc_strdup ("expected auto, always or never");
+      return false;
+    }
+  return true;
+}
+
 /* --ui's help text lists whatever is registered, so a new plugin shows
    up in --help without anything here changing.  yc_cmdline keeps the
    pointer rather than copying, hence the static buffer. */
@@ -202,6 +217,14 @@ int main(int argc, char **argv)
                          "directory for per-job files, "
                          "for those uis that write them",
                          "DIR", 0, &out_dir);
+
+  yc_cmdline_add_func ("colorize",
+                       "tint output by job: auto (the default, meaning "
+                       "only when stdout is a terminal), always, never",
+                       "WHEN",
+                       YC_CMDLINE_OPTIONAL,
+                       handle_colorize, &ui_options);
+  yc_cmdline_add_shortcut ('c', "colorize");
 
   yc_cmdline_add_func ("ui-option",
                        "pass an arbitrary setting through to the ui",

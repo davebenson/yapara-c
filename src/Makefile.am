@@ -28,6 +28,7 @@ libyc_a_SOURCES = \
 	yc-ui.h \
 	yc-ui-headless-jobs.c \
 	yc-ui-plain.c \
+	yc-ui-passthrough.c \
 	yc-ui-prefix.c
 
 LDADD = libyc.a $(LIBUV_LIBS)

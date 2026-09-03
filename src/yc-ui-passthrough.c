@@ -64,6 +64,7 @@ passthrough_all_done (YcUI *ui)
 const YcUIFuncs yc_ui_passthrough = {
   "passthrough",
   "let jobs write straight to this terminal; no capture, no tagging",
+  "The simplest UI, just let the outputs comingle.\n",
   0,                            /* no instance state of its own */
   0,                            /* flags */
   NULL,                         /* init */

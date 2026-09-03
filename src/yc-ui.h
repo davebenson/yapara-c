@@ -177,7 +177,8 @@ typedef enum
 
 struct YcUIFuncs {
   const char *name;               /* as given to --ui=NAME */
-  const char *description;        /* one line, for --help */
+  const char *description;        /* one line, for --list-backends */
+  const char *long_description;   /* one line, for --help-ui=UI */
   size_t instance_size;           /* >= sizeof(YcUI); 0 means exactly */
   YcUIFlags flags;
 

@@ -96,8 +96,9 @@ plain_all_done (YcUI *ui)
 
 const YcUIFuncs yc_ui_plain = {
   "plain",
-  "merge every job's output into one stream, a line at a time, "
+  "merge every job's output into one stream, a line at a time, " \
   "never splitting a line",
+  "Raw lines from processes.\n",
   sizeof (PlainUI),
   0,                            /* flags */
   NULL,                         /* init */

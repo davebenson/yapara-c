@@ -79,7 +79,8 @@ prefix_all_done (YcUI *ui)
 
 const YcUIFuncs yc_ui_prefix = {
   "prefix",
-  "tag each line with the job index and O (stdout) or E (stderr)",
+  "prefixed line-by-line output",
+  "Tag each line with the job index and O (stdout) or E (stderr)\n",
   0,                            /* no instance state of its own */
   0,                            /* flags */
   NULL,                         /* init */

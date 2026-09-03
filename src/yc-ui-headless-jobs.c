@@ -231,6 +231,11 @@ headless_jobs_all_done (YcUI *ui)
 const YcUIFuncs yc_ui_headless_jobs = {
   "headless-jobs",
   "write per-job .stdout/.stderr and start/end json under --out-dir",
+  "Write four files per job, numbered sequentially.\n" \
+  "  #-start.json    Information about the job, at its start.\n" \
+  "  #-end.json      Information about the job, at its end.\n" \
+  "  #.stdout        Standard output, if any is given.\n" \
+  "  #.stderr        Standard error, if any is given.\n",
   sizeof (HeadlessJobsUI),
   0,                            /* flags */
   headless_jobs_init,

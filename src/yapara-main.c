@@ -4,6 +4,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "yc-common.h"
 #include "yc-child.h"
 #include "yc-alloc.h"
@@ -169,6 +170,39 @@ ui_option_description (void)
   return description;
 }
 
+static YC_CMDLINE_CALLBACK_DECLARE (handle_list_uis)
+{
+  const YcUIFuncs *const *uis = NULL;
+  size_t n_uis = yc_ui_get_all (&uis);
+
+  int max_length = 0;
+  for (size_t i = 0; i < n_uis; i++)
+    {
+      int len = strlen (uis[i]->name);
+      if (len > max_length)
+        max_length = len;
+    }
+
+  printf("Available UIs:\n\n");
+  for (size_t i = 0; i < n_uis; i++)
+    printf("  %*s   %s\n", max_length, uis[i]->name, uis[i]->description);
+  printf("\nUse --help-ui=UI to get more information about a particular UI.\n");
+  exit (0);
+}
+
+static YC_CMDLINE_CALLBACK_DECLARE (handle_help_ui)
+{
+  const YcUIFuncs *ui = yc_ui_lookup (arg_value);
+  if (ui == NULL)
+    {
+      fprintf (stderr, "Unknown UI %s.  See --list-uis\n", arg_value);
+      exit(1);
+    }
+  printf("Information about the %s UI.\n\n", arg_value);
+  printf("%s\n", ui->long_description);
+  exit(0);
+}
+
 int main(int argc, char **argv)
 {
   yc_cmdline_init ("run programs in parallel",
@@ -231,6 +265,18 @@ int main(int argc, char **argv)
                        "KEY=VALUE",
                        YC_CMDLINE_TAKES_ARGUMENT | YC_CMDLINE_REPEATABLE,
                        handle_ui_option, &ui_options);
+
+  yc_cmdline_add_func ("list-uis",
+                       "print a list of all UIs and exit\n",
+                       NULL,
+                       0,
+                       handle_list_uis, NULL);
+  yc_cmdline_add_func ("help-ui",
+                       "print information about a particular UI\n",
+                       "UI",
+                       YC_CMDLINE_TAKES_ARGUMENT,
+                       handle_help_ui, NULL);
+
 
   yc_cmdline_process_args (&argc, &argv);
 

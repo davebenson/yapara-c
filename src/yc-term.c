@@ -193,67 +193,174 @@ yc_term_row_attr (YcTerm *term, const char *sgr)
   buf_add (&row->bytes, &row->len, &row->alloced, sgr, strlen (sgr));
 }
 
-/* Counts a UTF-8 lead byte as one column and continuation bytes as
-   none.  Wide characters still count as one, which is wrong for CJK
-   but keeps this from needing a width table. */
-static unsigned
-utf8_columns (const char *text, size_t len)
+/* Decodes one codepoint.  Returns the bytes consumed, or 0 if what is
+   there is not well-formed UTF-8 (truncated, overlong, a stray
+   continuation byte, or a surrogate) -- the caller substitutes a
+   replacement rather than passing dubious bytes to the terminal. */
+static size_t
+utf8_decode (const char *text, size_t len, uint32_t *cp_out)
 {
-  unsigned cols = 0;
-  size_t i;
-  for (i = 0; i < len; i++)
-    if (((unsigned char) text[i] & 0xc0) != 0x80)
-      cols++;
-  return cols;
+  const unsigned char *p = (const unsigned char *) text;
+  uint32_t cp;
+  size_t need, i;
+
+  if (len == 0)
+    return 0;
+
+  if (p[0] < 0x80)
+    {
+      *cp_out = p[0];
+      return 1;
+    }
+  if (p[0] < 0xc2)               /* continuation byte, or overlong C0/C1 */
+    return 0;
+  else if (p[0] < 0xe0) { need = 2; cp = p[0] & 0x1f; }
+  else if (p[0] < 0xf0) { need = 3; cp = p[0] & 0x0f; }
+  else if (p[0] < 0xf5) { need = 4; cp = p[0] & 0x07; }
+  else
+    return 0;
+
+  if (len < need)
+    return 0;
+  for (i = 1; i < need; i++)
+    {
+      if ((p[i] & 0xc0) != 0x80)
+        return 0;
+      cp = (cp << 6) | (uint32_t) (p[i] & 0x3f);
+    }
+
+  /* Overlong forms and UTF-16 surrogates are both ill-formed. */
+  if ((need == 3 && cp < 0x800) || (need == 4 && cp < 0x10000))
+    return 0;
+  if (cp >= 0xd800 && cp <= 0xdfff)
+    return 0;
+
+  *cp_out = cp;
+  return need;
+}
+
+typedef struct { uint32_t first, last; } CpRange;
+
+/* Zero-width: combining marks, and the format characters that a
+   terminal advances nothing for.  Not the complete Unicode Mn/Me/Cf
+   set -- the blocks that actually turn up in program output. */
+static const CpRange zero_width_ranges[] = {
+  { 0x0300, 0x036f }, { 0x0483, 0x0489 }, { 0x0591, 0x05bd },
+  { 0x05bf, 0x05bf }, { 0x05c1, 0x05c2 }, { 0x05c4, 0x05c5 },
+  { 0x05c7, 0x05c7 }, { 0x0610, 0x061a }, { 0x064b, 0x065f },
+  { 0x0670, 0x0670 }, { 0x06d6, 0x06dc }, { 0x06df, 0x06e4 },
+  { 0x06e7, 0x06e8 }, { 0x06ea, 0x06ed }, { 0x0711, 0x0711 },
+  { 0x0730, 0x074a }, { 0x07a6, 0x07b0 }, { 0x07eb, 0x07f3 },
+  { 0x0816, 0x0819 }, { 0x081b, 0x0823 }, { 0x0825, 0x0827 },
+  { 0x0829, 0x082d }, { 0x0900, 0x0903 }, { 0x093a, 0x093c },
+  { 0x0941, 0x0948 }, { 0x094d, 0x094d }, { 0x0951, 0x0957 },
+  { 0x0e31, 0x0e31 }, { 0x0e34, 0x0e3a }, { 0x0e47, 0x0e4e },
+  { 0x135d, 0x135f }, { 0x1ab0, 0x1aff }, { 0x1dc0, 0x1dff },
+  { 0x200b, 0x200f },                       /* ZWSP, ZWNJ, ZWJ, LRM, RLM */
+  { 0x2028, 0x202e }, { 0x2060, 0x2064 }, { 0x2066, 0x206f },
+  { 0x20d0, 0x20f0 }, { 0x302a, 0x302f }, { 0x3099, 0x309a },
+  { 0xfe00, 0xfe0f },                       /* variation selectors */
+  { 0xfe20, 0xfe2f },                       /* combining half marks */
+  { 0xfeff, 0xfeff },                       /* ZWNBSP / BOM */
+  { 0xfff9, 0xfffb },
+  { 0xe0100, 0xe01ef }                      /* variation selectors sup. */
+};
+
+/* Two columns: East Asian Wide and Fullwidth, plus the emoji blocks
+   that terminals almost universally render double-width. */
+static const CpRange wide_ranges[] = {
+  { 0x1100, 0x115f },                       /* Hangul Jamo initial */
+  { 0x2e80, 0x303e }, { 0x3041, 0x33ff },
+  { 0x3400, 0x4dbf }, { 0x4e00, 0x9fff },
+  { 0xa000, 0xa4cf },                       /* Yi */
+  { 0xac00, 0xd7a3 },                       /* Hangul syllables */
+  { 0xf900, 0xfaff },                       /* CJK compatibility */
+  { 0xfe10, 0xfe19 }, { 0xfe30, 0xfe6f },
+  { 0xff00, 0xff60 }, { 0xffe0, 0xffe6 },   /* fullwidth forms */
+  { 0x1f300, 0x1f64f }, { 0x1f680, 0x1f6ff },
+  { 0x1f900, 0x1f9ff }, { 0x1fa70, 0x1faff },
+  { 0x20000, 0x2fffd }, { 0x30000, 0x3fffd }
+};
+
+static bool
+in_ranges (uint32_t cp, const CpRange *ranges, size_t n)
+{
+  size_t lo = 0, hi = n;
+  while (lo < hi)
+    {
+      size_t mid = lo + (hi - lo) / 2;
+      if (cp < ranges[mid].first)
+        hi = mid;
+      else if (cp > ranges[mid].last)
+        lo = mid + 1;
+      else
+        return true;
+    }
+  return false;
+}
+
+/* How many columns the terminal will advance for this codepoint.
+ *
+ * An approximation, and worth being precise about which way: it is
+ * per-codepoint, so it gets combining marks, zero-width formatting and
+ * East Asian width right, but it has no notion of grapheme clusters.
+ * An emoji ZWJ sequence or a regional-indicator flag pair is several
+ * codepoints that a terminal draws as one glyph, and this will
+ * over-count those.  Getting that right needs cluster segmentation, and
+ * terminals disagree about it anyway.
+ */
+static unsigned
+codepoint_columns (uint32_t cp)
+{
+  if (cp == 0)
+    return 0;
+  if (in_ranges (cp, zero_width_ranges,
+                 sizeof (zero_width_ranges) / sizeof (zero_width_ranges[0])))
+    return 0;
+  if (in_ranges (cp, wide_ranges,
+                 sizeof (wide_ranges) / sizeof (wide_ranges[0])))
+    return 2;
+  return 1;
 }
 
 void
 yc_term_row_puts (YcTerm *term, const char *text, size_t len)
 {
   Row *row;
-  size_t i, take = 0;
-  unsigned room, used = 0;
+  size_t i = 0;
 
   if (term->current_row >= term->height || len == 0)
     return;
   row = &term->back[term->current_row];
-  if (row->cols >= term->width)
-    return;
-  room = term->width - row->cols;
 
-  /* Clip rather than wrap, and never split a UTF-8 sequence: walk
-     until the next lead byte would exceed the room left. */
-  for (i = 0; i < len; i++)
+  /* Clip rather than wrap, a codepoint at a time: a wide character
+     that would straddle the right edge is dropped rather than half
+     drawn, and a combining mark costs nothing so it stays with the
+     character it belongs to. */
+  while (i < len && row->cols < term->width)
     {
-      unsigned char c = (unsigned char) text[i];
-      bool is_lead = (c & 0xc0) != 0x80;
-      if (is_lead)
+      uint32_t cp = 0;
+      size_t n_bytes = utf8_decode (text + i, len - i, &cp);
+      unsigned cols;
+
+      /* Ill-formed bytes, control characters and DEL all become a
+         single '?': a child must not be able to drive the terminal
+         through us, and half a sequence must not reach it either. */
+      if (n_bytes == 0 || cp < 0x20 || cp == 0x7f)
         {
-          if (used == room)
-            break;
-          used++;
+          buf_add (&row->bytes, &row->len, &row->alloced, "?", 1);
+          row->cols += 1;
+          i += n_bytes == 0 ? 1 : n_bytes;
+          continue;
         }
-      /* Control characters would move the cursor or start an escape of
-         their own, so they are not passed through. */
-      take = i + 1;
+
+      cols = codepoint_columns (cp);
+      if (row->cols + cols > term->width)
+        break;
+      buf_add (&row->bytes, &row->len, &row->alloced, text + i, n_bytes);
+      row->cols += cols;
+      i += n_bytes;
     }
-
-  if (take == 0)
-    return;
-
-  /* Replace anything below space (and DEL) so a child cannot drive the
-     terminal through us. */
-  {
-    char *clean = yc_malloc (take);
-    for (i = 0; i < take; i++)
-      {
-        unsigned char c = (unsigned char) text[i];
-        clean[i] = (c < 0x20 || c == 0x7f) ? '?' : text[i];
-      }
-    buf_add (&row->bytes, &row->len, &row->alloced, clean, take);
-    yc_free (clean);
-  }
-  row->cols += utf8_columns (text, take);
 }
 
 void

@@ -187,6 +187,95 @@ test_control_characters_are_neutralised (void)
   yc_term_free (term);
 }
 
+/* Column accounting is per-codepoint, so a combining mark must cost
+   nothing and a wide character must cost two. */
+static void
+test_display_widths (void)
+{
+  KeyLog log;
+  YcTerm *term = new_term (&log, 6, 2);
+
+  /* "e" + U+0301 is one column, so six of them fit in six columns. */
+  yc_term_begin_frame (term);
+  yc_term_row_begin (term, 0);
+  yc_term_row_puts (term, "e\xcc\x81" "e\xcc\x81" "e\xcc\x81", 9);
+  yc_term_row_puts (term, "XYZ", 3);
+  yc_term_row_end (term);
+  yc_term_end_frame (term);
+  CHECK_STR ("combining marks cost no columns",
+             yc_term_frame_row (term, 0), "e\xcc\x81" "e\xcc\x81" "e\xcc\x81" "XYZ");
+
+  /* Zero-width characters likewise. */
+  yc_term_begin_frame (term);
+  yc_term_row_begin (term, 0);
+  yc_term_row_puts (term, "ab\xe2\x80\x8b" "cdef", 9);   /* U+200B ZWSP */
+  yc_term_row_end (term);
+  yc_term_end_frame (term);
+  CHECK_STR ("zero-width space costs nothing",
+             yc_term_frame_row (term, 0), "ab\xe2\x80\x8b" "cdef");
+
+  /* U+4E00 is wide, so three of them fill six columns and a fourth
+     does not fit. */
+  yc_term_begin_frame (term);
+  yc_term_row_begin (term, 0);
+  yc_term_row_puts (term, "\xe4\xb8\x80\xe4\xb8\x80\xe4\xb8\x80"
+                          "\xe4\xb8\x80", 12);
+  yc_term_row_end (term);
+  yc_term_end_frame (term);
+  CHECK_STR ("wide characters cost two columns",
+             yc_term_frame_row (term, 0),
+             "\xe4\xb8\x80\xe4\xb8\x80\xe4\xb8\x80");
+
+  /* A wide character straddling the edge is dropped, not half drawn. */
+  yc_term_begin_frame (term);
+  yc_term_row_begin (term, 0);
+  yc_term_row_puts (term, "abcde", 5);
+  yc_term_row_puts (term, "\xe4\xb8\x80", 3);
+  yc_term_row_end (term);
+  yc_term_end_frame (term);
+  CHECK_STR ("no half-drawn wide character",
+             yc_term_frame_row (term, 0), "abcde");
+  yc_term_free (term);
+}
+
+/* Ill-formed UTF-8 must not reach the terminal, whole or in part. */
+static void
+test_malformed_utf8 (void)
+{
+  KeyLog log;
+  YcTerm *term = new_term (&log, 20, 2);
+
+  yc_term_begin_frame (term);
+  yc_term_row_begin (term, 0);
+  yc_term_row_puts (term, "a\xff" "b", 3);              /* invalid byte */
+  yc_term_row_end (term);
+  yc_term_end_frame (term);
+  CHECK_STR ("invalid byte replaced", yc_term_frame_row (term, 0), "a?b");
+
+  yc_term_begin_frame (term);
+  yc_term_row_begin (term, 0);
+  yc_term_row_puts (term, "a\xe4\xb8", 3);           /* truncated */
+  yc_term_row_end (term);
+  yc_term_end_frame (term);
+  CHECK_STR ("truncated sequence replaced",
+             yc_term_frame_row (term, 0), "a??");
+
+  yc_term_begin_frame (term);
+  yc_term_row_begin (term, 0);
+  yc_term_row_puts (term, "\xc0\xaf", 2);            /* overlong '/' */
+  yc_term_row_end (term);
+  yc_term_end_frame (term);
+  CHECK_STR ("overlong form rejected", yc_term_frame_row (term, 0), "??");
+
+  yc_term_begin_frame (term);
+  yc_term_row_begin (term, 0);
+  yc_term_row_puts (term, "\xed\xa0\x80", 3);        /* surrogate D800 */
+  yc_term_row_end (term);
+  yc_term_end_frame (term);
+  CHECK_STR ("surrogate rejected", yc_term_frame_row (term, 0), "???");
+  yc_term_free (term);
+}
+
 static void
 test_pad (void)
 {
@@ -459,6 +548,8 @@ main (void)
   test_clipping ();
   test_attrs_do_not_consume_columns ();
   test_control_characters_are_neutralised ();
+  test_display_widths ();
+  test_malformed_utf8 ();
   test_pad ();
   test_only_changed_rows_are_written ();
   test_resize_forces_full_repaint ();

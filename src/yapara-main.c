@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 #include "yc-common.h"
 #include "yc-child.h"
 #include "yc-alloc.h"
@@ -294,7 +295,7 @@ int main(int argc, char **argv)
                    ? stdin
                    : fopen (input_filename, "r");
   if (input_file == NULL)
-    yc_die ("error opening %s: %m", input_filename);
+    yc_die ("error opening %s: %s", input_filename, strerror (errno));
 
   State state = {
     input_file,

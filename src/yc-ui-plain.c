@@ -25,21 +25,16 @@ typedef struct {
 } PlainUI;
 
 typedef struct {
+  YcUIJob base;                 /* must come first */
   uint64_t n_lines;
 } PlainJob;
-
-static void
-plain_job_started (YcUI *ui, YcUIJob *job)
-{
-  job->ui_data = YC_NEW0 (PlainJob);
-}
 
 static void
 plain_job_line (YcUI *ui, YcUIJob *job, int child_fd,
                 const char *line, size_t len, uint64_t micros)
 {
   PlainUI *plain = (PlainUI *) ui;
-  PlainJob *pjob = job->ui_data;
+  PlainJob *pjob = (PlainJob *) job;
 
   plain->n_lines++;
   pjob->n_lines++;
@@ -57,7 +52,6 @@ plain_job_line (YcUI *ui, YcUIJob *job, int child_fd,
 static void
 plain_job_ended (YcUI *ui, YcUIJob *job)
 {
-  PlainJob *pjob = job->ui_data;
   char index[YC_UI_INDEX_BUF_SIZE];
 
   /* stdout is block-buffered when it is not a terminal, but stderr
@@ -76,9 +70,6 @@ plain_job_ended (YcUI *ui, YcUIJob *job)
     fprintf (stderr, "%s[%s] %s: exited with status %d%s\n",
              yc_ui_job_color (ui, job), index, job->cmdline,
              job->status_value, yc_ui_color_reset (ui));
-
-  yc_free (pjob);
-  job->ui_data = NULL;
 }
 
 static void
@@ -100,12 +91,14 @@ const YcUIFuncs yc_ui_plain = {
   "never splitting a line",
   "Raw lines from processes.\n",
   sizeof (PlainUI),
+  sizeof (PlainJob),
   0,                            /* flags */
   NULL,                         /* init */
-  plain_job_started,
+  NULL,                         /* job_started: nothing left to set up */
   NULL,                         /* job_output: lines are enough */
   plain_job_line,
   plain_job_ended,
+  NULL,                         /* job_destroyed: nothing to free */
   plain_all_done,
   NULL                          /* destroy */
 };

@@ -22,6 +22,10 @@
 #include "yc-shell.h"
 #include "yc-ui.h"
 
+/* The bundled UIs the tests exercise directly. */
+extern const YcUIFuncs yc_ui_prefix;
+extern const YcUIFuncs yc_ui_headless_jobs;
+
 #define WATCHDOG_SECONDS 60
 #define MAX_REC_JOBS     32
 
@@ -114,8 +118,22 @@ typedef struct {
   Buf raw[3];          /* exact bytes, per child fd */
   Buf lines[3];        /* each delivered line, with '\n' re-added */
   unsigned n_lines[3];
+  unsigned n_lines_via_subclass;
+  unsigned n_destroyed;
   size_t max_line_len;
 } RecJob;
+
+/* Per-job state, carried inline in the job via job_instance_size.
+   'canary' guards the far end of the struct: if the framework
+   under-allocated, writing it would land outside the block and ASan
+   would say so. */
+#define REC_CANARY  0xfeedfaceu
+
+typedef struct {
+  YcUIJob base;                  /* must come first */
+  unsigned n_lines;
+  unsigned canary;
+} RecJobState;
 
 typedef struct {
   YcUI base;                     /* must come first */
@@ -123,7 +141,11 @@ typedef struct {
   unsigned n_all_done;
   size_t peak_n_jobs;
   bool init_ran, destroy_ran;
-  bool ui_data_missing;
+  bool subclass_was_dirty;       /* not zeroed on arrival */
+  bool destroyed_before_ended;
+  bool destroyed_while_retained;
+  bool canary_was_clobbered;
+  bool wrong_ui_backpointer;
 } RecUI;
 
 static bool
@@ -150,8 +172,16 @@ rec_job_started (YcUI *ui, YcUIJob *job)
   if (ui->n_jobs > rec->peak_n_jobs)
     rec->peak_n_jobs = ui->n_jobs;
 
-  /* Per-job state, to be released in job_ended(). */
-  job->ui_data = YC_NEW0 (unsigned);
+  /* The subclass space must arrive zeroed, and job->ui must point back
+     at us -- both are promises of the interface. */
+  {
+    RecJobState *state = (RecJobState *) job;
+    if (state->n_lines != 0 || state->canary != 0)
+      rec->subclass_was_dirty = true;
+    if (job->ui != ui)
+      rec->wrong_ui_backpointer = true;
+    state->canary = REC_CANARY;
+  }
 }
 
 static void
@@ -176,10 +206,13 @@ rec_job_line (YcUI *ui, YcUIJob *job, int child_fd,
 
   if (rjob->ended)
     rjob->line_after_end = true;
-  if (job->ui_data == NULL)
-    rec->ui_data_missing = true;
-  else
-    (*(unsigned *) job->ui_data)++;
+
+  {
+    RecJobState *state = (RecJobState *) job;
+    if (state->canary != REC_CANARY)
+      rec->canary_was_clobbered = true;
+    state->n_lines++;
+  }
 
   if (child_fd < 0 || child_fd >= 3)
     return;
@@ -206,8 +239,35 @@ rec_job_ended (YcUI *ui, YcUIJob *job)
   rjob->status_value = job->status_value;
   rjob->ended_micros = job->ended_micros;
 
-  yc_free (job->ui_data);
-  job->ui_data = NULL;
+  /* Nothing to free: the state lives in the job and goes with it. */
+  {
+    RecJobState *state = (RecJobState *) job;
+    if (state->canary != REC_CANARY)
+      rec->canary_was_clobbered = true;
+    rjob->n_lines_via_subclass = state->n_lines;
+  }
+}
+
+/* Freeing memory is this callback's whole job, so what matters is that
+   it fires exactly once per job and never before job_ended(). */
+static void
+rec_job_destroyed (YcUI *ui, YcUIJob *job)
+{
+  RecUI *rec = (RecUI *) ui;
+  RecJob *rjob = &rec->jobs[job->index];
+  size_t i;
+
+  if (!rjob->ended)
+    rec->destroyed_before_ended = true;
+  rjob->n_destroyed++;
+
+  /* By now it must be out of both arrays. */
+  for (i = 0; i < ui->n_ended_jobs; i++)
+    if (ui->ended_jobs[i] == job)
+      rec->destroyed_while_retained = true;
+  for (i = 0; i < ui->n_jobs; i++)
+    if (ui->jobs[i] == job)
+      rec->destroyed_while_retained = true;
 }
 
 static void
@@ -236,13 +296,16 @@ rec_destroy (YcUI *ui)
 static const YcUIFuncs rec_funcs = {
   "test-recorder",
   "records every event, for the test-suite",
+  "Test event recorder\n",
   sizeof (RecUI),
-  0,
+  sizeof (RecJobState),
+  0,                             /* flags */
   rec_init,
   rec_job_started,
   rec_job_output,
   rec_job_line,
   rec_job_ended,
+  rec_job_destroyed,
   rec_all_done,
   rec_destroy
 };
@@ -252,13 +315,16 @@ static const YcUIFuncs rec_funcs = {
 static const YcUIFuncs quiet_funcs = {
   "test-quiet",
   "watches jobs without reading their output",
+  "job watcher.\n",
   sizeof (RecUI),
-  0,
+  sizeof (RecJobState),
+  0,                             /* flags */
   rec_init,
   rec_job_started,
   NULL,                          /* no job_output */
   NULL,                          /* no job_line */
   rec_job_ended,
+  rec_job_destroyed,
   rec_all_done,
   rec_destroy
 };
@@ -463,8 +529,12 @@ test_lifecycle (void)
               !rec->jobs[0].line_after_end);
   CHECK_TRUE ("lifecycle: no output before job_started",
               !rec->jobs[0].output_without_start);
-  CHECK_TRUE ("lifecycle: ui_data was present for every line",
-              !rec->ui_data_missing);
+  CHECK_TRUE ("lifecycle: job subclass arrived zeroed",
+              !rec->subclass_was_dirty);
+  CHECK_TRUE ("lifecycle: job subclass survived intact",
+              !rec->canary_was_clobbered);
+  CHECK_TRUE ("lifecycle: job->ui points back at the ui",
+              !rec->wrong_ui_backpointer);
   CHECK_TRUE ("lifecycle: timestamps ordered",
               rec->jobs[0].started_micros > 0
            && rec->jobs[0].ended_micros >= rec->jobs[0].started_micros);
@@ -744,9 +814,226 @@ test_indices_and_concurrency (void)
   yc_ui_free (&rec->base);
 }
 
-/* --- the prefix UI --- */
+/* --- retaining finished jobs --- */
 
-extern const YcUIFuncs yc_ui_prefix;
+/* A UI that sets max_ended_jobs from init(); everything else is the
+   recorder, so its bookkeeping still applies. */
+static size_t retain_max = 0;
+
+static bool
+retain_init (YcUI *ui, char **error_message)
+{
+  ui->max_ended_jobs = retain_max;
+  return rec_init (ui, error_message);
+}
+
+static const YcUIFuncs retain_funcs = {
+  "test-retain",
+  "keeps finished jobs around",
+  "keeps finished jobs around\n",
+  sizeof (RecUI),
+  sizeof (RecJobState),
+  0,                             /* flags */
+  retain_init,
+  rec_job_started,
+  rec_job_output,
+  rec_job_line,
+  rec_job_ended,
+  rec_job_destroyed,
+  rec_all_done,
+  rec_destroy
+};
+
+/* The default: no retention, so a job dies as job_ended() returns. */
+static void
+test_no_retention_by_default (void)
+{
+  const char *cmdlines[3];
+  RecUI *rec;
+  size_t i;
+
+  for (i = 0; i < 3; i++)
+    cmdlines[i] = "echo x";
+  rec = run_jobs (&rec_funcs, cmdlines, 3, 1);
+
+  CHECK_UINT ("no retention: max_ended_jobs defaults to 0",
+              rec->base.max_ended_jobs, 0);
+  CHECK_UINT ("no retention: nothing retained", rec->base.n_ended_jobs, 0);
+  CHECK_UINT ("no retention: every job ended", rec->base.n_ended, 3);
+  for (i = 0; i < 3; i++)
+    CHECK_UINT ("no retention: destroyed exactly once",
+                rec->jobs[i].n_destroyed, 1);
+  CHECK_TRUE ("no retention: never destroyed before ended",
+              !rec->destroyed_before_ended);
+  CHECK_TRUE ("no retention: not destroyed while still listed",
+              !rec->destroyed_while_retained);
+  yc_ui_free (&rec->base);
+}
+
+static void
+test_retention_holds_finished_jobs (void)
+{
+  const char *cmdlines[4];
+  RecUI *rec;
+  size_t i;
+
+  for (i = 0; i < 4; i++)
+    cmdlines[i] = "echo x";
+
+  retain_max = 10;               /* more than enough for 4 jobs */
+  rec = run_jobs (&retain_funcs, cmdlines, 4, 1);
+
+  CHECK_UINT ("retention: all four held", rec->base.n_ended_jobs, 4);
+  /* Held, so not yet destroyed. */
+  for (i = 0; i < 4; i++)
+    CHECK_UINT ("retention: not destroyed while held",
+                rec->jobs[i].n_destroyed, 0);
+
+  /* Appended as they finish, so the array is in end-time order. */
+  CHECK_TRUE ("retention: oldest first",
+              rec->base.ended_jobs[0]->index == 0
+           && rec->base.ended_jobs[3]->index == 3);
+  for (i = 1; i < rec->base.n_ended_jobs; i++)
+    CHECK_TRUE ("retention: end times do not go backwards",
+                rec->base.ended_jobs[i]->ended_micros
+                >= rec->base.ended_jobs[i - 1]->ended_micros);
+
+  /* A held job is still fully readable -- the whole point. */
+  CHECK_TRUE ("retention: held job is marked finished",
+              !rec->base.ended_jobs[0]->running);
+  CHECK_STR ("retention: held job kept its cmdline",
+             rec->base.ended_jobs[0]->cmdline, "echo x");
+
+  /* yc_ui_free() must still destroy what is left. */
+  yc_ui_free (&rec->base);
+}
+
+/* The cap evicts the oldest, and never the job that just arrived. */
+static void
+test_retention_evicts_oldest (void)
+{
+  const char *cmdlines[6];
+  RecUI *rec;
+  size_t i;
+
+  for (i = 0; i < 6; i++)
+    cmdlines[i] = "echo x";
+
+  retain_max = 2;
+  rec = run_jobs (&retain_funcs, cmdlines, 6, 1);
+
+  CHECK_UINT ("eviction: never exceeds the cap", rec->base.n_ended_jobs, 2);
+  /* The two most recent survive; the first four were evicted. */
+  CHECK_UINT ("eviction: newest retained", rec->base.ended_jobs[1]->index, 5);
+  CHECK_UINT ("eviction: second newest retained",
+              rec->base.ended_jobs[0]->index, 4);
+  for (i = 0; i < 4; i++)
+    CHECK_UINT ("eviction: evicted jobs were destroyed once",
+                rec->jobs[i].n_destroyed, 1);
+  for (i = 4; i < 6; i++)
+    CHECK_UINT ("eviction: retained jobs not yet destroyed",
+                rec->jobs[i].n_destroyed, 0);
+  CHECK_TRUE ("eviction: never destroyed before ended",
+              !rec->destroyed_before_ended);
+
+  yc_ui_free (&rec->base);
+}
+
+static void
+test_reap_job (void)
+{
+  const char *cmdlines[3];
+  RecUI *rec;
+  YcUIJob *middle;
+
+  cmdlines[0] = "echo x";
+  cmdlines[1] = "echo y";
+  cmdlines[2] = "echo z";
+
+  retain_max = 10;
+  rec = run_jobs (&retain_funcs, cmdlines, 3, 1);
+  CHECK_UINT ("reap: three held to begin with", rec->base.n_ended_jobs, 3);
+
+  /* Reaping out of the middle must close the gap, not leave a hole. */
+  middle = rec->base.ended_jobs[1];
+  yc_ui_reap_job (&rec->base, middle);
+  CHECK_UINT ("reap: one fewer held", rec->base.n_ended_jobs, 2);
+  CHECK_UINT ("reap: reaped job destroyed once",
+              rec->jobs[1].n_destroyed, 1);
+  CHECK_UINT ("reap: the array closed up (0 then 2)",
+              rec->base.ended_jobs[0]->index, 0);
+  CHECK_UINT ("reap: the array closed up (index 1 is job 2)",
+              rec->base.ended_jobs[1]->index, 2);
+  CHECK_UINT ("reap: others untouched", rec->jobs[0].n_destroyed, 0);
+
+  /* Walking backwards is the documented way to reap in a loop. */
+  while (rec->base.n_ended_jobs > 0)
+    yc_ui_reap_job (&rec->base,
+                    rec->base.ended_jobs[rec->base.n_ended_jobs - 1]);
+  CHECK_UINT ("reap: all reaped", rec->base.n_ended_jobs, 0);
+  CHECK_UINT ("reap: job 0 destroyed once", rec->jobs[0].n_destroyed, 1);
+  CHECK_UINT ("reap: job 2 destroyed once", rec->jobs[2].n_destroyed, 1);
+
+  yc_ui_free (&rec->base);
+}
+
+/* --- job subclassing --- */
+
+/* A job's inline state has to survive every callback and be released
+   with the job.  Under ASan, a framework that allocated only
+   sizeof(YcUIJob) would be caught writing the canary. */
+static void
+test_job_subclassing (void)
+{
+  const char *cmdlines[3];
+  RecUI *rec;
+  size_t i;
+
+  cmdlines[0] = "printf 'a\\nb\\nc\\n'";
+  cmdlines[1] = "echo one";
+  cmdlines[2] = "sh -c 'exit 0'";
+  rec = run_jobs (&rec_funcs, cmdlines, 3, 1);
+
+  CHECK_TRUE ("subclass: arrived zeroed", !rec->subclass_was_dirty);
+  CHECK_TRUE ("subclass: intact at every callback",
+              !rec->canary_was_clobbered);
+  CHECK_TRUE ("subclass: job->ui is the ui that spawned it",
+              !rec->wrong_ui_backpointer);
+
+  /* Counted in the job's own space, read back in job_ended: proof the
+     state persisted across callbacks rather than being re-zeroed. */
+  CHECK_UINT ("subclass: per-job count survived (3 lines)",
+              rec->jobs[0].n_lines_via_subclass, 3);
+  CHECK_UINT ("subclass: per-job count survived (1 line)",
+              rec->jobs[1].n_lines_via_subclass, 1);
+  CHECK_UINT ("subclass: per-job count for a silent job",
+              rec->jobs[2].n_lines_via_subclass, 0);
+
+  /* Each job gets its own copy, not a shared one. */
+  for (i = 0; i < 3; i++)
+    CHECK_TRUE ("subclass: every job was started", rec->jobs[i].started);
+
+  yc_ui_free (&rec->base);
+}
+
+/* A UI that asks for no per-job space still works; the framework just
+   allocates a bare YcUIJob. */
+static void
+test_no_job_subclass (void)
+{
+  const char *cmdlines[1];
+  char *out = NULL, *err = NULL;
+
+  CHECK_UINT ("no subclass: prefix asks for none",
+              yc_ui_prefix.job_instance_size, 0);
+  cmdlines[0] = "echo fine";
+  run_capturing (&yc_ui_prefix, cmdlines, 1, 1, NULL, &out, &err);
+  CHECK_STR ("no subclass: still works", out, "0O: fine\n");
+  yc_free (out);
+  yc_free (err);
+}
+
+/* --- the prefix UI --- */
 
 /* max_children of 1 makes the interleaving deterministic: the next job
    only starts once the previous one's pipes have drained. */
@@ -1043,8 +1330,6 @@ test_prefix_ui_registered (void)
 }
 
 /* --- the headless-jobs UI --- */
-
-extern const YcUIFuncs yc_ui_headless_jobs;
 
 static char *
 job_file_path (const char *dir, const char *name)
@@ -1375,6 +1660,12 @@ main (void)
   test_quiet_ui_captures_nothing ();
   test_failure_accounting ();
   test_indices_and_concurrency ();
+  test_no_retention_by_default ();
+  test_retention_holds_finished_jobs ();
+  test_retention_evicts_oldest ();
+  test_reap_job ();
+  test_job_subclassing ();
+  test_no_job_subclass ();
   test_prefix_ui_registered ();
   test_prefix_ui_format ();
   test_prefix_ui_quiet_when_all_succeed ();

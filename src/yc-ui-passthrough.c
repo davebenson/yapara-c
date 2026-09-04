@@ -66,12 +66,14 @@ const YcUIFuncs yc_ui_passthrough = {
   "let jobs write straight to this terminal; no capture, no tagging",
   "The simplest UI, just let the outputs comingle.\n",
   0,                            /* no instance state of its own */
+  0,                            /* no per-job state either */
   0,                            /* flags */
   NULL,                         /* init */
   NULL,                         /* job_started */
   NULL,                         /* job_output: deliberately unset -- */
   NULL,                         /* job_line:   this is what skips capture */
   passthrough_job_ended,
+  NULL,                         /* job_destroyed */
   passthrough_all_done,
   NULL                          /* destroy */
 };

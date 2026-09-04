@@ -35,6 +35,7 @@ typedef struct {
 } HeadlessJobsUI;
 
 typedef struct {
+  YcUIJob base;                 /* must come first */
   FILE *stream[2];              /* fd 1, fd 2; opened on first byte */
   uint64_t n_bytes[2];
   char index[YC_UI_INDEX_BUF_SIZE];
@@ -126,10 +127,9 @@ static void
 headless_jobs_job_started (YcUI *ui, YcUIJob *job)
 {
   HeadlessJobsUI *hj = (HeadlessJobsUI *) ui;
-  HeadlessJobsJob *hjob = YC_NEW0 (HeadlessJobsJob);
+  HeadlessJobsJob *hjob = (HeadlessJobsJob *) job;
   FILE *fp;
 
-  job->ui_data = hjob;
   yc_ui_format_index_for_filename (ui->options, job->index,
                                    hjob->index, sizeof (hjob->index));
 
@@ -151,7 +151,7 @@ headless_jobs_job_output (YcUI *ui, YcUIJob *job, int child_fd,
                           const void *data, size_t len, uint64_t micros)
 {
   HeadlessJobsUI *hj = (HeadlessJobsUI *) ui;
-  HeadlessJobsJob *hjob = job->ui_data;
+  HeadlessJobsJob *hjob = (HeadlessJobsJob *) job;
   int slot = SLOT_OF_FD (child_fd);
 
   if (hjob->stream[slot] == NULL)
@@ -167,7 +167,7 @@ static void
 headless_jobs_job_ended (YcUI *ui, YcUIJob *job)
 {
   HeadlessJobsUI *hj = (HeadlessJobsUI *) ui;
-  HeadlessJobsJob *hjob = job->ui_data;
+  HeadlessJobsJob *hjob = (HeadlessJobsJob *) job;
   bool killed = job->status == YC_CHILD_STATUS_KILLED;
   FILE *fp;
   int slot;
@@ -209,9 +209,6 @@ headless_jobs_job_ended (YcUI *ui, YcUIJob *job)
            (unsigned long long) hjob->n_bytes[1]);
   fprintf (fp, "}\n");
   fclose (fp);
-
-  yc_free (hjob);
-  job->ui_data = NULL;
 }
 
 static void
@@ -237,12 +234,14 @@ const YcUIFuncs yc_ui_headless_jobs = {
   "  #.stdout        Standard output, if any is given.\n" \
   "  #.stderr        Standard error, if any is given.\n",
   sizeof (HeadlessJobsUI),
+  sizeof (HeadlessJobsJob),
   0,                            /* flags */
   headless_jobs_init,
   headless_jobs_job_started,
   headless_jobs_job_output,     /* raw bytes: what lands on disk is exact */
   NULL,                         /* job_line: not wanted */
   headless_jobs_job_ended,
+  NULL,                         /* job_destroyed: files close at end */
   headless_jobs_all_done,
   NULL                          /* destroy */
 };

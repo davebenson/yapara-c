@@ -22,6 +22,8 @@ typedef struct YcUILineBuf {
   size_t len, alloced;
 } YcUILineBuf;
 
+static void ended_jobs_trim (YcUI *ui);
+
 uint64_t
 yc_now_micros (void)
 {
@@ -367,6 +369,7 @@ extern const YcUIFuncs yc_ui_plain;
 extern const YcUIFuncs yc_ui_prefix;
 extern const YcUIFuncs yc_ui_headless_jobs;
 extern const YcUIFuncs yc_ui_passthrough;
+extern const YcUIFuncs yc_ui_two_pane;
 
 static void
 register_builtins_once (void)
@@ -379,6 +382,7 @@ register_builtins_once (void)
   yc_ui_register (&yc_ui_prefix);
   yc_ui_register (&yc_ui_headless_jobs);
   yc_ui_register (&yc_ui_passthrough);
+  yc_ui_register (&yc_ui_two_pane);
 }
 
 void
@@ -391,6 +395,10 @@ yc_ui_register (const YcUIFuncs *funcs)
   if (funcs->instance_size != 0 && funcs->instance_size < sizeof (YcUI))
     yc_die ("yc_ui_register: %s: instance_size %u is smaller than YcUI",
             funcs->name, (unsigned) funcs->instance_size);
+  if (funcs->job_instance_size != 0
+   && funcs->job_instance_size < sizeof (YcUIJob))
+    yc_die ("yc_ui_register: %s: job_instance_size %u is smaller than "
+            "YcUIJob", funcs->name, (unsigned) funcs->job_instance_size);
 
   for (i = 0; i < n_registered; i++)
     if (strcmp (registry[i]->name, funcs->name) == 0)
@@ -463,8 +471,14 @@ yc_ui_free (YcUI *ui)
 {
   if (ui == NULL)
     return;
+  /* Retained jobs go before the UI's own destroy(), so job_destroyed()
+     still runs while whatever it points into is alive. */
+  ui->max_ended_jobs = 0;
+  ended_jobs_trim (ui);
+
   if (ui->funcs->destroy != NULL)
     ui->funcs->destroy (ui);
+  yc_free (ui->ended_jobs);
   yc_free (ui->jobs);
   yc_free (ui);
 }
@@ -522,6 +536,68 @@ job_free (YcUIJob *job)
   yc_free (job->pending);
   yc_free ((char *) job->cmdline);
   yc_free (job);
+}
+
+/* The one place a job's memory goes away, so job_destroyed() cannot be
+   missed on any of the paths that get here. */
+static void
+job_destroy (YcUI *ui, YcUIJob *job)
+{
+  if (ui->funcs->job_destroyed != NULL)
+    ui->funcs->job_destroyed (ui, job);
+  job_free (job);
+}
+
+/* Appended as they finish, so the array is already in end-time order
+   and the oldest to evict is always at the front. */
+static void
+ended_jobs_append (YcUI *ui, YcUIJob *job)
+{
+  if (ui->n_ended_jobs == ui->ended_jobs_alloced)
+    {
+      ui->ended_jobs_alloced = ui->ended_jobs_alloced == 0
+                             ? 8 : ui->ended_jobs_alloced * 2;
+      ui->ended_jobs = YC_RENEW (YcUIJob *, ui->ended_jobs,
+                                 ui->ended_jobs_alloced);
+    }
+  ui->ended_jobs[ui->n_ended_jobs++] = job;
+}
+
+static bool
+ended_jobs_remove (YcUI *ui, YcUIJob *job)
+{
+  size_t i;
+  for (i = 0; i < ui->n_ended_jobs; i++)
+    if (ui->ended_jobs[i] == job)
+      {
+        memmove (ui->ended_jobs + i, ui->ended_jobs + i + 1,
+                 sizeof (YcUIJob *) * (ui->n_ended_jobs - i - 1));
+        ui->n_ended_jobs--;
+        return true;
+      }
+  return false;
+}
+
+/* max_ended_jobs is public and a UI may lower it mid-run, so this
+   loops rather than dropping a single job. */
+static void
+ended_jobs_trim (YcUI *ui)
+{
+  while (ui->n_ended_jobs > ui->max_ended_jobs)
+    {
+      YcUIJob *oldest = ui->ended_jobs[0];
+      ended_jobs_remove (ui, oldest);
+      job_destroy (ui, oldest);
+    }
+}
+
+void
+yc_ui_reap_job (YcUI *ui, YcUIJob *job)
+{
+  if (!ended_jobs_remove (ui, job))
+    yc_die ("yc_ui_reap_job: job %llu is not a retained finished job",
+            (unsigned long long) job->index);
+  job_destroy (ui, job);
 }
 
 /* --- line reassembly --- */
@@ -672,14 +748,26 @@ ui_child_done (YcChild *child)
   if (job->status != YC_CHILD_STATUS_EXITED || job->status_value != 0)
     ui->n_failed++;
 
-  /* Off the table before the callback, so a UI that redraws from
-     ui->jobs does not show a job it is being told has finished. */
+  /* Move it across before the callback, so a UI that redraws from
+     either array during job_ended() sees one consistent world: gone
+     from the running list, already in the finished one. */
   jobs_remove (ui, job);
+  if (ui->max_ended_jobs > 0)
+    {
+      /* Append first, then trim: trimming to the cap beforehand would
+         still leave room for this one to push the total to max + 1.
+         The new job is at the back, so it is never what gets evicted
+         (max is at least 1 here). */
+      ended_jobs_append (ui, job);
+      ended_jobs_trim (ui);
+    }
 
   if (ui->funcs->job_ended != NULL)
     ui->funcs->job_ended (ui, job);
 
-  job_free (job);
+  /* Nowhere to retain it, so this is also the end of its life. */
+  if (ui->max_ended_jobs == 0)
+    job_destroy (ui, job);
 }
 
 static YcChildCallbacks ui_child_callbacks = {
@@ -720,7 +808,11 @@ yc_ui_spawn (YcUI *ui,
   if (create_info->fd_infos[0].mode == YC_CHILD_FD_MODE_INHERIT)
     create_info->fd_infos[0].mode = YC_CHILD_FD_MODE_NULL;
 
-  job = YC_NEW0 (YcUIJob);
+  /* The UI may have asked for a bigger job than YcUIJob, to keep its
+     own per-job state inline.  Zeroed, so a subclass starts blank. */
+  job = yc_malloc0 (ui->funcs->job_instance_size != 0
+                    ? ui->funcs->job_instance_size
+                    : sizeof (YcUIJob));
   job->ui = ui;
   job->index = ui->n_started;
   job->cmdline = yc_strdup (cmdline);

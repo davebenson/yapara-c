@@ -17,28 +17,36 @@ libyc_a_SOURCES = \
 	yc-buffer.h \
 	yc-child.c \
 	yc-child.h \
+	yc-circular-buffer.h \
+	yc-circular-buffer.c \
 	yc-cmdline.c \
 	yc-cmdline.h \
 	yc-common.c \
 	yc-common.h \
 	yc-rbtree-macros.h \
 	yc-shell.c \
+	yc-term.c \
+	yc-term.h \
 	yc-shell.h \
 	yc-ui.c \
 	yc-ui.h \
 	yc-ui-headless-jobs.c \
 	yc-ui-plain.c \
 	yc-ui-passthrough.c \
-	yc-ui-prefix.c
+	yc-ui-prefix.c \
+	yc-ui-two-pane.c
 
 LDADD = libyc.a $(LIBUV_LIBS)
 
 bin_PROGRAMS = yapara
 yapara_SOURCES = yapara-main.c
 
-check_PROGRAMS = test-shell test-child test-ui
+check_PROGRAMS = test-shell test-child test-ui test-circular-buffer \
+	test-term
 TESTS = $(check_PROGRAMS)
 
 test_shell_SOURCES = test-shell.c
 test_child_SOURCES = test-child.c
 test_ui_SOURCES = test-ui.c
+test_circular_buffer_SOURCES = test-circular-buffer.c
+test_term_SOURCES = test-term.c

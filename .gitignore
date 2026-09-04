@@ -20,9 +20,8 @@ Makefile.in
 
 # programs
 /src/yapara
-/src/test-shell
-/src/test-child
-/src/test-ui
+/src/test-*
+!/src/test-*.c
 *.dSYM/
 
 # dist tarballs

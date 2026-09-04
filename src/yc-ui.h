@@ -15,9 +15,15 @@
  *
  * and never touches a pipe itself.
  *
+ * Both the UI and its jobs are subclassed C-style: set instance_size
+ * and job_instance_size to the size of a struct whose first member is
+ * a YcUI or a YcUIJob, and cast.  The framework allocates and zeroes
+ * that much, so per-job state needs no allocation of its own and is
+ * released with the job.
+ *
  * Two rules for a UI implementation:
- *   - Anything you hang off job->ui_data in job_started() must be
- *     released in job_ended(); the job is freed once that returns.
+ *   - Whatever your job subclass *points at* must still be released in
+ *     job_ended(); the job itself is freed once that returns.
  *   - job_output() gets the child's bytes exactly as they arrived,
  *     with no decoding, so a UI that records a run byte-for-byte can.
  *     job_line() is the convenient view; they are independent and both
@@ -160,10 +166,11 @@ struct YcUIJob {
   int status_value;
   uint64_t started_micros, ended_micros;
 
-  void *ui_data;                  /* yours; free it in job_ended() */
+  /* The UI this job belongs to.  A callback handed only a job still
+     has its way back to the instance. */
+  YcUI *ui;
 
   /*< private >*/
-  YcUI *ui;
   struct YcUILineBuf *pending;    /* partial lines, per captured fd */
 };
 
@@ -180,6 +187,16 @@ struct YcUIFuncs {
   const char *description;        /* one line, for --list-backends */
   const char *long_description;   /* one line, for --help-ui=UI */
   size_t instance_size;           /* >= sizeof(YcUI); 0 means exactly */
+
+  /* Per-job state, the same way: set this to sizeof(YourJob), where
+     YourJob has a YcUIJob as its first member, and every job is
+     allocated that big and zeroed.  The extra space belongs to the UI
+     for the job's lifetime and goes away with it -- so there is
+     nothing to allocate in job_started() and nothing to free in
+     job_ended() except whatever the UI itself points at.  0 means
+     plain YcUIJobs. */
+  size_t job_instance_size;
+
   YcUIFlags flags;
 
   /* Anything that can fail belongs here rather than in the vtable's
@@ -199,9 +216,21 @@ struct YcUIFuncs {
   void (*job_line)    (YcUI *ui, YcUIJob *job, int child_fd,
                        const char *line, size_t len, uint64_t micros);
 
-  void (*job_ended)   (YcUI *ui, YcUIJob *job);
-  void (*all_done)    (YcUI *ui);
-  void (*destroy)     (YcUI *ui);
+  /* The job has finished and its output is complete.  This is for
+     saying so -- printing a line, writing a record, marking a row
+     dirty -- not for releasing memory: the job is still entirely
+     valid, and with max_ended_jobs set it stays valid afterwards. */
+  void (*job_ended)     (YcUI *ui, YcUIJob *job);
+
+  /* The job is about to be freed, so this is where its memory goes.
+     Fires exactly once per job, on every path: straight after
+     job_ended() when max_ended_jobs is 0, on yc_ui_reap_job(), when
+     an old job is evicted to stay under the cap, and for whatever is
+     left at yc_ui_free(). */
+  void (*job_destroyed) (YcUI *ui, YcUIJob *job);
+
+  void (*all_done)      (YcUI *ui);
+  void (*destroy)       (YcUI *ui);
 };
 
 struct YcUI {
@@ -217,17 +246,32 @@ struct YcUI {
   bool colorize;
 
   /* Jobs currently running, in the order they started -- stable, so a
-     selection pane does not jump around.  Finished jobs are gone from
-     here by the time job_ended() returns. */
+     selection pane does not jump around.  A finished job has moved to
+     ended_jobs by the time job_ended() is called. */
   YcUIJob **jobs;
   size_t n_jobs;
 
+  /* Finished jobs still being held, oldest first -- which is end-time
+     order, since they are appended as they finish.
+
+     max_ended_jobs is 0 by default, meaning a job is destroyed as soon
+     as job_ended() returns and this array stays empty.  A UI that
+     wants finished jobs to stay inspectable sets it from init(); the
+     oldest is then evicted whenever a new one would exceed it.  Note
+     that n_ended_jobs is how many are *retained*, whereas n_ended
+     below is how many have ever finished. */
+  YcUIJob **ended_jobs;
+  size_t n_ended_jobs;
+  size_t max_ended_jobs;
+
+  /* Cumulative counts, for the whole run. */
   uint64_t n_started, n_ended, n_failed;
 
   void *user_data;
 
   /*< private >*/
   size_t jobs_alloced;
+  size_t ended_jobs_alloced;
 };
 
 /* --- the registry --- */
@@ -284,6 +328,15 @@ YcChild *yc_ui_spawn (YcUI                *ui,
                       YcChildCreateInfo   *create_info,
                       const char          *cmdline,
                       YcChildCreateError  *error_out);
+
+/* Destroys a retained finished job now: calls job_destroyed() and
+ * frees it.  Only valid for a job in ui->ended_jobs -- reaping a
+ * running job, or one already reaped, is a programming error and says
+ * so.
+ *
+ * This shifts ui->ended_jobs, so an index into that array is stale
+ * afterwards; walk it backwards if reaping as you go. */
+void yc_ui_reap_job (YcUI *ui, YcUIJob *job);
 
 /* Call once the container's run has finished. */
 void yc_ui_all_done (YcUI *ui);

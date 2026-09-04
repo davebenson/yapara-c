@@ -24,13 +24,14 @@ libyc_a_SOURCES = \
 	yc-common.c \
 	yc-common.h \
 	yc-rbtree-macros.h \
+	yc-recorder.h \
+	yc-recorder-jobs.c \
 	yc-shell.c \
 	yc-term.c \
 	yc-term.h \
 	yc-shell.h \
 	yc-ui.c \
 	yc-ui.h \
-	yc-ui-headless-jobs.c \
 	yc-ui-plain.c \
 	yc-ui-passthrough.c \
 	yc-ui-prefix.c \

@@ -88,22 +88,35 @@ unsigned          yc_circular_buffer_add (YcCircularBuffer *buffer,
       // of the write_pos, if there's only one line left.
       uint32_t oldest_line_end = (buffer->num_lines == 1)
                                ? buffer->write_pos
-                               : oldest_line_index == (buffer->num_lines - 1)
+                               : oldest_line_index + 1 == buffer->max_lines
                                ? buffer->lines[0].line_start
                                : buffer->lines[oldest_line_index+1].line_start;
 
-      // length = (end - start) MOD buffer_size
-      uint32_t oldest_line_len = oldest_line_start <= oldest_line_end
-                               ? (oldest_line_end - oldest_line_start)
-                               : (oldest_line_end + buffer->buffer_size - oldest_line_start);
+      // length = (end - start) MOD buffer_size.
+      //
+      // start==end is ambiguous: the line is either empty or fills the
+      // ring exactly.  With one line left its length is simply the
+      // occupancy -- and taking it as 0 would leave the occupancy
+      // unchanged and spin this loop forever.
+      uint32_t oldest_line_len;
+      if (oldest_line_start == oldest_line_end)
+        oldest_line_len = buffer->num_lines == 1 ? buffer->buf_occupancy : 0;
+      else if (oldest_line_start < oldest_line_end)
+        oldest_line_len = oldest_line_end - oldest_line_start;
+      else
+        oldest_line_len = oldest_line_end + buffer->buffer_size
+                        - oldest_line_start;
 
       buffer->num_lines -= 1;
       buffer->buf_occupancy -= oldest_line_len;
       n_evicted += 1;
     }
 
-  // Add new line record.
-  buffer->lines[buffer->write_line_index++] = (YcCircularBufferLineInfo) {
+  // Add new line record.  Keep the slot: write_line_index moves on
+  // below, and the associated data has to land in the *same* slot as
+  // the record, which is where get_line() looks for it.
+  unsigned line_index = buffer->write_line_index++;
+  buffer->lines[line_index] = (YcCircularBufferLineInfo) {
     truncated,
     buffer->write_pos
   };
@@ -111,7 +124,7 @@ unsigned          yc_circular_buffer_add (YcCircularBuffer *buffer,
   // And associated data.
   if (buffer->line_data_size > 0)
     {
-      char *dst = buffer->line_data + buffer->write_line_index * buffer->line_data_size;
+      char *dst = buffer->line_data + line_index * buffer->line_data_size;
       if (line_data)
         memcpy (dst, line_data, buffer->line_data_size);
       else
@@ -165,6 +178,22 @@ yc_circular_buffer_get_line (YcCircularBuffer *buf,
 
   const void *line_data = buf->line_data + arr_idx * buf->line_data_size;
   bool truncated = buf->lines[arr_idx].is_truncated;
+
+  // start==end means empty, or exactly the whole ring.  Only a lone
+  // line can be the latter, and then its length is the occupancy.
+  if (start == end && buf->num_lines == 1 && buf->buf_occupancy > 0)
+    {
+      if (start + buf->buf_occupancy <= buf->buffer_size)
+        return (YcCircularBufferLine) {
+          buf->buf + start, buf->buf_occupancy, NULL, 0, truncated, line_data
+        };
+      return (YcCircularBufferLine) {
+        buf->buf + start, buf->buffer_size - start,
+        buf->buf, buf->buf_occupancy - (buf->buffer_size - start),
+        truncated, line_data
+      };
+    }
+
   if (start <= end)
     {
       return (YcCircularBufferLine) {

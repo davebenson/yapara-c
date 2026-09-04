@@ -1,6 +1,10 @@
 /* SPDX-License-Identifier: 0BSD */
-/* The 'headless-jobs' UI: nothing on the terminal, four files per job
- * under --out-dir, for picking over afterwards.
+/* The 'jobs' recorder: four files per job under --out-dir, for picking
+ * over afterwards.
+ *
+ * A recorder rather than a UI, so it runs alongside whichever UI is
+ * presenting the run: '--ui=two-pane --recorder=jobs' watches a run and
+ * writes it down at the same time.
  *
  *     000042-start.json    index, pid, cmdline, when it began
  *     000042-end.json      how it finished, how long it took, byte counts
@@ -27,19 +31,20 @@
 
 #include "yc-common.h"
 #include "yc-alloc.h"
-#include "yc-ui.h"
+#include "yc-recorder.h"
 
 typedef struct {
-  YcUI base;                    /* must come first */
+  YcRecorder base;              /* must come first */
   const char *out_dir;
-} HeadlessJobsUI;
+  uint64_t n_jobs, n_failed;
+} JobsRecorder;
 
+/* Per-job state, handed back to us on every call for that job. */
 typedef struct {
-  YcUIJob base;                 /* must come first */
   FILE *stream[2];              /* fd 1, fd 2; opened on first byte */
   uint64_t n_bytes[2];
   char index[YC_UI_INDEX_BUF_SIZE];
-} HeadlessJobsJob;
+} JobsRecord;
 
 #define SLOT_OF_FD(child_fd)   ((child_fd) == 2 ? 1 : 0)
 #define FD_SUFFIX(slot)        ((slot) == 1 ? ".stderr" : ".stdout")
@@ -78,25 +83,25 @@ write_json_string (FILE *fp, const char *str)
 /* --- paths --- */
 
 static void
-job_path (HeadlessJobsUI *hj,
-          HeadlessJobsJob *hjob,
+job_path (JobsRecorder *jr,
+          JobsRecord *record,
           const char *suffix,
           char *buf,
           size_t buf_size)
 {
-  snprintf (buf, buf_size, "%s/%s%s", hj->out_dir, hjob->index, suffix);
+  snprintf (buf, buf_size, "%s/%s%s", jr->out_dir, record->index, suffix);
 }
 
 /* Losing output silently would be worse than stopping. */
 static FILE *
-open_job_file (HeadlessJobsUI *hj,
-               HeadlessJobsJob *hjob,
+open_job_file (JobsRecorder *jr,
+               JobsRecord *record,
                const char *suffix)
 {
   char path[1024];
   FILE *fp;
 
-  job_path (hj, hjob, suffix, path, sizeof (path));
+  job_path (jr, record, suffix, path, sizeof (path));
   fp = fopen (path, "w");
   if (fp == NULL)
     yc_die ("error creating %s: %s", path, strerror (errno));
@@ -106,34 +111,34 @@ open_job_file (HeadlessJobsUI *hj,
 /* --- the vtable --- */
 
 static bool
-headless_jobs_init (YcUI *ui, char **error_message)
+jobs_init (YcRecorder *recorder, char **error_message)
 {
-  HeadlessJobsUI *hj = (HeadlessJobsUI *) ui;
+  JobsRecorder *jr = (JobsRecorder *) recorder;
 
-  if (ui->options->out_dir == NULL)
+  if (recorder->options->out_dir == NULL)
     {
       *error_message =
-        yc_strdup ("this ui writes files, so it needs --out-dir=DIR");
+        yc_strdup ("--recorder=jobs writes files, so it needs --out-dir=DIR");
       return false;
     }
-  if (!yc_ui_options_ensure_out_dir (ui->options, error_message))
+  if (!yc_ui_options_ensure_out_dir (recorder->options, error_message))
     return false;
 
-  hj->out_dir = ui->options->out_dir;
+  jr->out_dir = recorder->options->out_dir;
   return true;
 }
 
-static void
-headless_jobs_job_started (YcUI *ui, YcUIJob *job)
+static void *
+jobs_job_started (YcRecorder *recorder, YcUIJob *job)
 {
-  HeadlessJobsUI *hj = (HeadlessJobsUI *) ui;
-  HeadlessJobsJob *hjob = (HeadlessJobsJob *) job;
+  JobsRecorder *jr = (JobsRecorder *) recorder;
+  JobsRecord *record = YC_NEW0 (JobsRecord);
   FILE *fp;
 
-  yc_ui_format_index_for_filename (ui->options, job->index,
-                                   hjob->index, sizeof (hjob->index));
+  yc_ui_format_index_for_filename (recorder->options, job->index,
+                                   record->index, sizeof (record->index));
 
-  fp = open_job_file (hj, hjob, "-start.json");
+  fp = open_job_file (jr, record, "-start.json");
   fprintf (fp, "{\n");
   fprintf (fp, "  \"index\": %llu,\n", (unsigned long long) job->index);
   fprintf (fp, "  \"pid\": %d,\n", job->pid);
@@ -144,44 +149,48 @@ headless_jobs_job_started (YcUI *ui, YcUIJob *job)
            (unsigned long long) job->started_micros);
   fprintf (fp, "}\n");
   fclose (fp);
+
+  jr->n_jobs++;
+  return record;
 }
 
 static void
-headless_jobs_job_output (YcUI *ui, YcUIJob *job, int child_fd,
-                          const void *data, size_t len, uint64_t micros)
+jobs_job_output (YcRecorder *recorder, YcUIJob *job, void *job_state,
+                 int child_fd, const void *data, size_t len,
+                 uint64_t micros)
 {
-  HeadlessJobsUI *hj = (HeadlessJobsUI *) ui;
-  HeadlessJobsJob *hjob = (HeadlessJobsJob *) job;
+  JobsRecorder *jr = (JobsRecorder *) recorder;
+  JobsRecord *record = job_state;
   int slot = SLOT_OF_FD (child_fd);
 
-  if (hjob->stream[slot] == NULL)
-    hjob->stream[slot] = open_job_file (hj, hjob, FD_SUFFIX (slot));
+  if (record->stream[slot] == NULL)
+    record->stream[slot] = open_job_file (jr, record, FD_SUFFIX (slot));
 
-  if (fwrite (data, 1, len, hjob->stream[slot]) != len)
+  if (fwrite (data, 1, len, record->stream[slot]) != len)
     yc_die ("error writing %s%s: %s",
-            hjob->index, FD_SUFFIX (slot), strerror (errno));
-  hjob->n_bytes[slot] += len;
+            record->index, FD_SUFFIX (slot), strerror (errno));
+  record->n_bytes[slot] += len;
 }
 
 static void
-headless_jobs_job_ended (YcUI *ui, YcUIJob *job)
+jobs_job_ended (YcRecorder *recorder, YcUIJob *job, void *job_state)
 {
-  HeadlessJobsUI *hj = (HeadlessJobsUI *) ui;
-  HeadlessJobsJob *hjob = (HeadlessJobsJob *) job;
+  JobsRecorder *jr = (JobsRecorder *) recorder;
+  JobsRecord *record = job_state;
   bool killed = job->status == YC_CHILD_STATUS_KILLED;
   FILE *fp;
   int slot;
 
   for (slot = 0; slot < 2; slot++)
-    if (hjob->stream[slot] != NULL)
+    if (record->stream[slot] != NULL)
       {
-        if (fclose (hjob->stream[slot]) != 0)
+        if (fclose (record->stream[slot]) != 0)
           yc_die ("error closing %s%s: %s",
-                  hjob->index, FD_SUFFIX (slot), strerror (errno));
-        hjob->stream[slot] = NULL;
+                  record->index, FD_SUFFIX (slot), strerror (errno));
+        record->stream[slot] = NULL;
       }
 
-  fp = open_job_file (hj, hjob, "-end.json");
+  fp = open_job_file (jr, record, "-end.json");
   fprintf (fp, "{\n");
   fprintf (fp, "  \"index\": %llu,\n", (unsigned long long) job->index);
   fprintf (fp, "  \"pid\": %d,\n", job->pid);
@@ -204,44 +213,47 @@ headless_jobs_job_ended (YcUI *ui, YcUIJob *job)
     fprintf (fp, "  \"exit_code\": %d,\n  \"signal\": null,\n",
              job->status_value);
   fprintf (fp, "  \"stdout_bytes\": %llu,\n",
-           (unsigned long long) hjob->n_bytes[0]);
+           (unsigned long long) record->n_bytes[0]);
   fprintf (fp, "  \"stderr_bytes\": %llu\n",
-           (unsigned long long) hjob->n_bytes[1]);
+           (unsigned long long) record->n_bytes[1]);
   fprintf (fp, "}\n");
   fclose (fp);
+
+  if (killed || job->status_value != 0)
+    jr->n_failed++;
+
+  /* Ours to release: the framework only keeps the pointer. */
+  yc_free (record);
 }
 
+/* A recorder shares the terminal with whatever ui is presenting, so it
+   says as little as possible -- and nothing at all on a clean run. */
 static void
-headless_jobs_all_done (YcUI *ui)
+jobs_all_done (YcRecorder *recorder)
 {
-  HeadlessJobsUI *hj = (HeadlessJobsUI *) ui;
+  JobsRecorder *jr = (JobsRecorder *) recorder;
 
-  /* The only thing this ui says on a terminal, and only when there is
-     something to say. */
-  if (ui->n_failed > 0)
-    fprintf (stderr, "%llu of %llu jobs failed; see %s\n",
-             (unsigned long long) ui->n_failed,
-             (unsigned long long) ui->n_started,
-             hj->out_dir);
+  /* The ui has already said how many failed; repeating the count would
+     just be two voices saying the same thing.  Where to look for the
+     output is the part only this recorder knows. */
+  if (jr->n_failed > 0)
+    fprintf (stderr, "recorded output is in %s\n", jr->out_dir);
 }
 
-const YcUIFuncs yc_ui_headless_jobs = {
-  "headless-jobs",
+const YcRecorderFuncs yc_recorder_jobs = {
+  "jobs",
   "write per-job .stdout/.stderr and start/end json under --out-dir",
   "Write four files per job, numbered sequentially.\n" \
   "  #-start.json    Information about the job, at its start.\n" \
   "  #-end.json      Information about the job, at its end.\n" \
   "  #.stdout        Standard output, if any is given.\n" \
   "  #.stderr        Standard error, if any is given.\n",
-  sizeof (HeadlessJobsUI),
-  sizeof (HeadlessJobsJob),
-  0,                            /* flags */
-  headless_jobs_init,
-  headless_jobs_job_started,
-  headless_jobs_job_output,     /* raw bytes: what lands on disk is exact */
+  sizeof (JobsRecorder),
+  jobs_init,
+  jobs_job_started,
+  jobs_job_output,              /* raw bytes: what lands on disk is exact */
   NULL,                         /* job_line: not wanted */
-  headless_jobs_job_ended,
-  NULL,                         /* job_destroyed: files close at end */
-  headless_jobs_all_done,
+  jobs_job_ended,
+  jobs_all_done,
   NULL                          /* destroy */
 };

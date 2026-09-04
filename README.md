@@ -11,9 +11,10 @@ Two things make it different from a shell loop with `&`:
   redirection — to spawn most jobs directly. For short-lived jobs, an
   extra `sh -c` per job can cost more than the job. Lines that need a
   real shell are recognised and given one.
-- **Presentation is a plug-in.** The same run can print tagged lines to
-  a terminal, or write per-job files for later analysis, without the
-  job-running code knowing which.
+- **Presentation is a plug-in, and separate from recording.** One run
+  has one UI — tagged lines, or a full-screen two-pane browser — plus
+  any number of recorders writing it to disk. Watching a run and
+  keeping a record of it are not an either/or.
 
 ## Building
 
@@ -64,14 +65,23 @@ $ yapara --input=jobs.txt --max=4
 | --- | --- |
 | `--input=FILENAME` | Job list, one command-line per line. `-` for stdin. Required. |
 | `--max=N` | How many jobs to run at once. Default 10. |
-| `--ui=NAME` | Which presentation to use. Default `plain`. |
-| `--out-dir=DIR` | Where UIs that write files should put them. Created if missing, parents included. |
+| `--ui=NAME` | Which presentation to use. Default `plain`. `--list-uis` names them, `--help-ui=NAME` explains one. |
+| `--recorder=NAME` | Also record the run, alongside the UI. Repeatable. `--list-recorders` names them. |
+| `--out-dir=DIR` | Where anything that writes files should put them. Created if missing, parents included. |
+| `--colorize[=WHEN]`, `-c` | Tint output by job. `auto` (the default: only when stdout is a terminal), `always`, `never`. |
 | `--index-width=N` | Pad job indices to at least N digits. |
 | `--index-zero-pad` | Pad indices with zeroes rather than spaces. |
 | `--index-hex` | Print indices in hexadecimal. |
 | `--ui-option=KEY=VALUE` | Pass a setting through to the UI. Repeatable; the last use of a key wins. |
 
 Job indices count from 0, in the order jobs start.
+
+A run has **one UI and any number of recorders**, so watching a run and
+writing it down are not an either/or:
+
+```sh
+yapara --input=jobs.txt --ui=two-pane --recorder=jobs --out-dir=results
+```
 
 ## Job-file syntax
 
@@ -163,12 +173,66 @@ $ yapara --input=jobs.txt --ui=prefix --index-width=6 --index-zero-pad
 000001O: out-1
 ```
 
-### `headless-jobs`
+### `two-pane`
 
-Nothing on the terminal; four files per job under `--out-dir`.
+Full screen: a job list on top, the selected job's output below. Needs
+a terminal.
 
 ```
-$ yapara --input=jobs.txt --ui=headless-jobs --out-dir=results --index-width=4
+ 3 running, 12 done, 1 failed
+> 0003  running  convert c.png c.jpg
+  0004  running  convert d.png d.jpg
+  0001  exit 1   convert a.png a.jpg
+-- job 0003 -----------------------------------
+converting c.png
+done
+```
+
+| key | |
+| --- | --- |
+| `Up`/`Down`, `k`/`j` | select a job |
+| `PgUp`/`PgDn` | scroll the output |
+| `Home`/`End` | oldest / newest output |
+| `[`/`]` | move the divider |
+| `q`, `Ctrl-C` | quit |
+
+Each job's output goes into a fixed-size circular buffer, so a job that
+prints for an hour costs the same as one that prints a line. Finished
+jobs stay listed and stay readable — the job you want to look at is
+usually the one that just failed. The run does not exit when the last
+job does; it waits for you to quit.
+
+`--ui-option` settings: `buffer-size`, `max-lines`, `keep-jobs`,
+`job-rows`.
+
+### `passthrough`
+
+Gets out of the way: the children inherit yapara's own stdout and
+stderr and write straight to them. Nothing is copied through the
+process, and interleaving is whatever the OS does — much like `cmd &`
+in a shell.
+
+This is worth more than it sounds. Putting a pipe on a child's stdout
+makes its libc switch from line buffering to 4kB block buffering, so a
+chatty job stops emitting whole lines and starts emitting late blocks
+that splice into other jobs' output mid-line. Leaving the terminal in
+place keeps every child line-buffered. The trade is that nothing knows
+which job wrote what, so there is nothing to tag or colour.
+
+## Recorders
+
+A recorder observes a run without presenting it, and any number can run
+alongside the chosen UI:
+
+```sh
+yapara --input=jobs.txt --ui=two-pane --recorder=jobs --out-dir=results
+```
+
+### `jobs`
+
+Four files per job under `--out-dir`.
+
+```
 $ ls results
 0000-end.json  0000-start.json  0000.stdout
 0001-end.json  0001-start.json  0001.stderr  0001.stdout
@@ -245,6 +309,14 @@ Three things to know:
   set both.
 - Anything hung off `job->ui_data` must be freed in `job_ended`.
 
+If what you are writing only *observes* a run — writing it to disk,
+shipping it somewhere — write a **recorder** instead, against the much
+smaller interface in `src/yc-recorder.h`. A recorder gets told that a
+job started, that bytes arrived and that it ended; it does not subclass
+the job, does not see `ui->jobs`, and never touches the terminal. That
+is what lets any number of them run alongside the UI. `yc-recorder-jobs.c`
+is the worked example.
+
 If your UI writes files, use `--out-dir` via
 `yc_ui_options_ensure_out_dir()` rather than inventing another option.
 And if it mixes output on stdout with diagnostics on stderr, `fflush`
@@ -257,16 +329,21 @@ a terminal and the complaint will otherwise overtake what it is about.
 make check
 ```
 
-Three programs, 406 assertions:
+Five programs:
 
 | | |
 | --- | --- |
 | `test-shell` | the job-line parser, in isolation |
 | `test-child` | process supervision — really spawns processes |
-| `test-ui` | the UI framework and the bundled UIs |
+| `test-ui` | the UI framework, the bundled UIs, and the recorders |
+| `test-term` | the terminal layer: frames, clipping, key decoding |
+| `test-circular-buffer` | the bounded per-job output buffer |
 
 `test-child` and `test-ui` have watchdog alarms, because several of the
 things they check fail by hanging rather than by giving a wrong answer.
+`test-term` runs entirely headless — `yc_term_new_headless()` renders
+frames into memory and takes fed keystrokes — so the TUI's layout and
+key handling are asserted byte-for-byte rather than eyeballed.
 
 ## Layout
 
@@ -274,8 +351,11 @@ things they check fail by hanging rather than by giving a wrong answer.
 | --- | --- |
 | `src/yc-child.c` | spawning and supervising children; the concurrency limit |
 | `src/yc-shell.c` | one line of shell into a process description |
-| `src/yc-ui.c` | UI plug-in framework: indices, capture, line reassembly |
+| `src/yc-ui.c` | plug-in framework: indices, capture, line reassembly, recorders |
 | `src/yc-ui-*.c` | the bundled UIs |
+| `src/yc-recorder-*.c` | the bundled recorders |
+| `src/yc-term.c` | raw mode, key decoding and a diffed frame buffer |
+| `src/yc-circular-buffer.c` | bounded line storage, for the two-pane UI |
 | `src/yapara-main.c` | command-line handling and the job-file reader |
 | `src/yc-buffer.c`, `yc-cmdline.c`, `yc-alloc.c`, `yc-common.c` | support code |
 

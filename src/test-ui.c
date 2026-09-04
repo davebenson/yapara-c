@@ -21,10 +21,11 @@
 #include "yc-common.h"
 #include "yc-shell.h"
 #include "yc-ui.h"
+#include "yc-recorder.h"
 
 /* The bundled UIs the tests exercise directly. */
 extern const YcUIFuncs yc_ui_prefix;
-extern const YcUIFuncs yc_ui_headless_jobs;
+extern const YcRecorderFuncs yc_recorder_jobs;
 
 #define WATCHDOG_SECONDS 60
 #define MAX_REC_JOBS     32
@@ -329,6 +330,10 @@ static const YcUIFuncs quiet_funcs = {
   rec_destroy
 };
 
+/* Attached to the run by run_jobs_with() when set, so a recorder can be
+   exercised alongside any ui. */
+static const YcRecorderFuncs *extra_recorder = NULL;
+
 /* --- driving a run --- */
 
 typedef struct {
@@ -385,6 +390,16 @@ run_jobs_with (const YcUIFuncs *funcs,
   ui = yc_ui_new (funcs, container->loop, options, &error_message);
   if (ui == NULL)
     yc_die ("test-ui: yc_ui_new: %s", error_message);
+
+  if (extra_recorder != NULL)
+    {
+      char *recorder_error = NULL;
+      YcRecorder *recorder = yc_recorder_new (extra_recorder, options,
+                                              &recorder_error);
+      if (recorder == NULL)
+        yc_die ("test-ui: yc_recorder_new: %s", recorder_error);
+      yc_ui_add_recorder (ui, recorder);
+    }
 
   memset (&feeder, 0, sizeof (feeder));
   feeder.ui = ui;
@@ -819,6 +834,7 @@ test_indices_and_concurrency (void)
 /* A UI that sets max_ended_jobs from init(); everything else is the
    recorder, so its bookkeeping still applies. */
 static size_t retain_max = 0;
+
 
 static bool
 retain_init (YcUI *ui, char **error_message)
@@ -1329,7 +1345,7 @@ test_prefix_ui_registered (void)
               yc_ui_prefix.instance_size, 0);
 }
 
-/* --- the headless-jobs UI --- */
+/* --- the 'jobs' recorder --- */
 
 static char *
 job_file_path (const char *dir, const char *name)
@@ -1388,22 +1404,25 @@ remove_out_dir (const char *dir)
 }
 
 static void
-test_headless_jobs_needs_out_dir (void)
+test_jobs_recorder_needs_out_dir (void)
 {
-  YcUI *ui;
+  YcRecorder *recorder;
   char *error = NULL;
   YcUIOptions options;
 
   yc_ui_options_init (&options);
-  ui = yc_ui_new (&yc_ui_headless_jobs, NULL, &options, &error);
-  CHECK_TRUE ("headless: refuses to start without --out-dir", ui == NULL);
-  CHECK_TRUE ("headless: says why", error != NULL);
+  recorder = yc_recorder_new (&yc_recorder_jobs, &options, &error);
+  CHECK_TRUE ("jobs recorder: refuses to start without --out-dir",
+              recorder == NULL);
+  CHECK_TRUE ("jobs recorder: says why", error != NULL);
   yc_free (error);
 }
 
 static void
-test_headless_jobs_files (void)
+test_jobs_recorder_files (void)
 {
+  /* The ui here reads nothing; the recorder is the only consumer,
+     which is also what proves capture is derived from recorders. */
   const char *cmdlines[4];
   YcUIOptions options;
   char *out = NULL, *err = NULL, *json;
@@ -1416,77 +1435,81 @@ test_headless_jobs_files (void)
 
   yc_ui_options_init (&options);
   options.out_dir = dir;
+  extra_recorder = &yc_recorder_jobs;
   options.index_format.width = 4;
-  run_capturing (&yc_ui_headless_jobs, cmdlines, 4, 1, &options, &out, &err);
+  run_capturing (&quiet_funcs, cmdlines, 4, 1, &options, &out, &err);
 
   /* A width of 4 with no --index-zero-pad still zero-pads the
      filename, so the names sort. */
-  CHECK_TRUE ("headless: 0000-start.json",
+  CHECK_TRUE ("jobs recorder: 0000-start.json",
               job_file_exists (dir, "0000-start.json"));
-  CHECK_TRUE ("headless: 0000-end.json",
+  CHECK_TRUE ("jobs recorder: 0000-end.json",
               job_file_exists (dir, "0000-end.json"));
-  CHECK_STR ("headless: stdout is byte-exact",
+  CHECK_STR ("jobs recorder: stdout is byte-exact",
              read_job_file (dir, "0000.stdout"), "hello\n");
 
   /* Nothing was written to stderr, so no file was made: the byte
      counts in -end.json say so, making absence unambiguous. */
-  CHECK_TRUE ("headless: no .stderr when nothing was written",
+  CHECK_TRUE ("jobs recorder: no .stderr when nothing was written",
               !job_file_exists (dir, "0000.stderr"));
 
-  CHECK_STR ("headless: both streams, separately (out)",
+  CHECK_STR ("jobs recorder: both streams, separately (out)",
              read_job_file (dir, "0001.stdout"), "to-out\n");
-  CHECK_STR ("headless: both streams, separately (err)",
+  CHECK_STR ("jobs recorder: both streams, separately (err)",
              read_job_file (dir, "0001.stderr"), "to-err\n");
 
   json = read_job_file (dir, "0000-start.json");
-  CHECK_JSON_HAS ("headless: start index", json, "\"index\": 0,");
-  CHECK_JSON_HAS ("headless: start cmdline", json,
+  CHECK_JSON_HAS ("jobs recorder: start index", json, "\"index\": 0,");
+  CHECK_JSON_HAS ("jobs recorder: start cmdline", json,
                   "\"cmdline\": \"echo hello\"");
-  CHECK_JSON_HAS ("headless: start has a timestamp", json,
+  CHECK_JSON_HAS ("jobs recorder: start has a timestamp", json,
                   "\"started_micros\": ");
   yc_free (json);
 
   json = read_job_file (dir, "0000-end.json");
-  CHECK_JSON_HAS ("headless: clean exit status", json,
+  CHECK_JSON_HAS ("jobs recorder: clean exit status", json,
                   "\"status\": \"exited\",");
-  CHECK_JSON_HAS ("headless: clean exit code", json, "\"exit_code\": 0,");
-  CHECK_JSON_HAS ("headless: signal is null when it exited", json,
+  CHECK_JSON_HAS ("jobs recorder: clean exit code", json, "\"exit_code\": 0,");
+  CHECK_JSON_HAS ("jobs recorder: signal is null when it exited", json,
                   "\"signal\": null,");
-  CHECK_JSON_HAS ("headless: stdout byte count", json,
+  CHECK_JSON_HAS ("jobs recorder: stdout byte count", json,
                   "\"stdout_bytes\": 6,");
-  CHECK_JSON_HAS ("headless: stderr byte count", json,
+  CHECK_JSON_HAS ("jobs recorder: stderr byte count", json,
                   "\"stderr_bytes\": 0");
-  CHECK_JSON_HAS ("headless: elapsed is reported", json,
+  CHECK_JSON_HAS ("jobs recorder: elapsed is reported", json,
                   "\"elapsed_micros\": ");
   yc_free (json);
 
   json = read_job_file (dir, "0002-end.json");
-  CHECK_JSON_HAS ("headless: nonzero exit code", json, "\"exit_code\": 7,");
+  CHECK_JSON_HAS ("jobs recorder: nonzero exit code", json, "\"exit_code\": 7,");
   yc_free (json);
 
   /* A signalled job reports the signal, and nulls exit_code, so the
      shape is the same either way. */
   json = read_job_file (dir, "0003-end.json");
-  CHECK_JSON_HAS ("headless: killed status", json, "\"status\": \"killed\",");
-  CHECK_JSON_HAS ("headless: exit_code is null when killed", json,
+  CHECK_JSON_HAS ("jobs recorder: killed status", json, "\"status\": \"killed\",");
+  CHECK_JSON_HAS ("jobs recorder: exit_code is null when killed", json,
                   "\"exit_code\": null,");
-  CHECK_JSON_HAS ("headless: signal", json, "\"signal\": 15,");
+  CHECK_JSON_HAS ("jobs recorder: signal", json, "\"signal\": 15,");
   yc_free (json);
 
-  /* Nothing on our stdout: that is the point of it being headless. */
-  CHECK_STR ("headless: says nothing on stdout", out, "");
+  /* Nothing on our stdout: a recorder writes files, not screens. */
+  CHECK_STR ("jobs recorder: says nothing on stdout", out, "");
 
   yc_free (out);
   yc_free (err);
   yc_ui_options_clear (&options);
+  extra_recorder = NULL;
   remove_out_dir (dir);
 }
 
 /* Raw bytes, not lines: no CRLF rewriting and no newline invented for
    a final unterminated line. */
 static void
-test_headless_jobs_writes_raw_bytes (void)
+test_jobs_recorder_writes_raw_bytes (void)
 {
+  /* The ui here reads nothing; the recorder is the only consumer,
+     which is also what proves capture is derived from recorders. */
   const char *cmdlines[1];
   YcUIOptions options;
   char *out = NULL, *err = NULL, *contents;
@@ -1495,27 +1518,31 @@ test_headless_jobs_writes_raw_bytes (void)
   cmdlines[0] = "printf 'a\\r\\nb'";
   yc_ui_options_init (&options);
   options.out_dir = dir;
-  run_capturing (&yc_ui_headless_jobs, cmdlines, 1, 1, &options, &out, &err);
+  extra_recorder = &yc_recorder_jobs;
+  run_capturing (&quiet_funcs, cmdlines, 1, 1, &options, &out, &err);
 
   contents = read_job_file (dir, "0.stdout");
-  CHECK_STR ("headless: raw bytes preserved", contents, "a\r\nb");
+  CHECK_STR ("jobs recorder: raw bytes preserved", contents, "a\r\nb");
   yc_free (contents);
 
   contents = read_job_file (dir, "0-end.json");
-  CHECK_JSON_HAS ("headless: byte count matches", contents,
+  CHECK_JSON_HAS ("jobs recorder: byte count matches", contents,
                   "\"stdout_bytes\": 4,");
   yc_free (contents);
 
   yc_free (out);
   yc_free (err);
   yc_ui_options_clear (&options);
+  extra_recorder = NULL;
   remove_out_dir (dir);
 }
 
 /* A cmdline is arbitrary text, so the json writer has to escape it. */
 static void
-test_headless_jobs_escapes_json (void)
+test_jobs_recorder_escapes_json (void)
 {
+  /* The ui here reads nothing; the recorder is the only consumer,
+     which is also what proves capture is derived from recorders. */
   const char *cmdlines[1];
   YcUIOptions options;
   char *out = NULL, *err = NULL, *json;
@@ -1526,16 +1553,18 @@ test_headless_jobs_escapes_json (void)
   cmdlines[0] = "echo \"a\\\\b\"";
   yc_ui_options_init (&options);
   options.out_dir = dir;
-  run_capturing (&yc_ui_headless_jobs, cmdlines, 1, 1, &options, &out, &err);
+  extra_recorder = &yc_recorder_jobs;
+  run_capturing (&quiet_funcs, cmdlines, 1, 1, &options, &out, &err);
 
   json = read_job_file (dir, "0-start.json");
-  CHECK_JSON_HAS ("headless: quotes and backslashes escaped", json,
+  CHECK_JSON_HAS ("jobs recorder: quotes and backslashes escaped", json,
                   "\"cmdline\": \"echo \\\"a\\\\\\\\b\\\"\"");
   yc_free (json);
 
   yc_free (out);
   yc_free (err);
   yc_ui_options_clear (&options);
+  extra_recorder = NULL;
   remove_out_dir (dir);
 }
 
@@ -1590,6 +1619,7 @@ test_out_dir_is_created (void)
   yc_free (error);
 
   yc_ui_options_clear (&options);
+  extra_recorder = NULL;
   remove_out_dir (dir);
 }
 
@@ -1619,10 +1649,10 @@ test_filename_index_always_zero_pads (void)
 }
 
 static void
-test_headless_jobs_registered (void)
+test_jobs_recorder_registered (void)
 {
-  CHECK_TRUE ("headless: is built in",
-              yc_ui_lookup ("headless-jobs") == &yc_ui_headless_jobs);
+  CHECK_TRUE ("jobs recorder: is built in",
+              yc_recorder_lookup ("jobs") == &yc_recorder_jobs);
 }
 
 /* --- watchdog --- */
@@ -1676,12 +1706,12 @@ main (void)
   test_prefix_ui_honours_index_options ();
   test_index_options_reach_failure_notes ();
   test_filename_index_always_zero_pads ();
-  test_headless_jobs_registered ();
-  test_headless_jobs_needs_out_dir ();
+  test_jobs_recorder_registered ();
+  test_jobs_recorder_needs_out_dir ();
   test_out_dir_is_created ();
-  test_headless_jobs_files ();
-  test_headless_jobs_writes_raw_bytes ();
-  test_headless_jobs_escapes_json ();
+  test_jobs_recorder_files ();
+  test_jobs_recorder_writes_raw_bytes ();
+  test_jobs_recorder_escapes_json ();
 
   if (n_failures > 0)
     {

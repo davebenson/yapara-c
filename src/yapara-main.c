@@ -11,8 +11,11 @@
 #include "yc-alloc.h"
 #include "yc-shell.h"
 #include "yc-ui.h"
+#include "yc-recorder.h"
 #include "yc-cmdline.h"
 
+
+#define MAX_RECORDERS 8
 
 typedef struct State
 {
@@ -20,6 +23,10 @@ typedef struct State
   bool done;
   YcUI *ui;
 } State;
+
+/* Collected from --record, then attached once the ui exists. */
+static const char *recorder_names[MAX_RECORDERS];
+static size_t n_recorder_names;
 
 /* Reads one line, without its newline; NULL at end-of-file.  Grows to
    fit the line, and does not drop a last line that has no newline --
@@ -149,6 +156,45 @@ static YC_CMDLINE_CALLBACK_DECLARE (handle_colorize)
   return true;
 }
 
+/* Repeatable: a run has one ui but any number of recorders. */
+static YC_CMDLINE_CALLBACK_DECLARE (handle_recorder)
+{
+  if (n_recorder_names == MAX_RECORDERS)
+    {
+      *error = yc_strdup ("too many --recorder options");
+      return false;
+    }
+  if (yc_recorder_lookup (arg_value) == NULL)
+    {
+      *error = yc_malloc (128);
+      snprintf (*error, 128, "no such recorder '%s' (try --list-recorders)",
+                arg_value);
+      return false;
+    }
+  recorder_names[n_recorder_names++] = arg_value;
+  return true;
+}
+
+static YC_CMDLINE_CALLBACK_DECLARE (handle_list_recorders)
+{
+  const YcRecorderFuncs *const *all = NULL;
+  size_t n = yc_recorder_get_all (&all);
+  int width = 0;
+
+  for (size_t i = 0; i < n; i++)
+    {
+      int len = strlen (all[i]->name);
+      if (len > width)
+        width = len;
+    }
+  printf ("Available recorders:\n\n");
+  for (size_t i = 0; i < n; i++)
+    printf ("  %*s   %s\n", width, all[i]->name, all[i]->description);
+  printf ("\nRecorders run alongside the --ui, and --recorder may be "
+          "repeated.\n");
+  exit (0);
+}
+
 /* --ui's help text lists whatever is registered, so a new plugin shows
    up in --help without anything here changing.  yc_cmdline keeps the
    pointer rather than copying, hence the static buffer. */
@@ -261,6 +307,15 @@ int main(int argc, char **argv)
                        handle_colorize, &ui_options);
   yc_cmdline_add_shortcut ('c', "colorize");
 
+  yc_cmdline_add_func ("recorder",
+                       "also record the run; may be given more than once",
+                       "NAME",
+                       YC_CMDLINE_TAKES_ARGUMENT | YC_CMDLINE_REPEATABLE,
+                       handle_recorder, NULL);
+  yc_cmdline_add_func ("list-recorders", "list the available recorders",
+                       NULL, YC_CMDLINE_OPTIONAL,
+                       handle_list_recorders, NULL);
+
   yc_cmdline_add_func ("ui-option",
                        "pass an arbitrary setting through to the ui",
                        "KEY=VALUE",
@@ -322,6 +377,20 @@ int main(int argc, char **argv)
   state.ui = yc_ui_new (ui_funcs, container->loop, &ui_options, &ui_error);
   if (state.ui == NULL)
     yc_die ("error starting ui '%s': %s", ui_name, ui_error);
+
+  /* Before the first spawn: attaching a recorder is what decides
+     whether the children's output needs capturing. */
+  for (size_t i = 0; i < n_recorder_names; i++)
+    {
+      char *record_error = NULL;
+      YcRecorder *recorder =
+        yc_recorder_new (yc_recorder_lookup (recorder_names[i]),
+                         &ui_options, &record_error);
+      if (recorder == NULL)
+        yc_die ("error starting recorder '%s': %s",
+                recorder_names[i], record_error);
+      yc_ui_add_recorder (state.ui, recorder);
+    }
 
   // blocks on main loop until processes finish and callbacks don't add more.
   // ready_to_spawn() is invoked from in there, so there is no need to

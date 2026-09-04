@@ -11,6 +11,7 @@
 #include "yc-common.h"
 #include "yc-alloc.h"
 #include "yc-ui.h"
+#include "yc-recorder.h"
 
 /* stdout and stderr; the only fds the UI layer captures. */
 #define N_CAPTURED_FDS   2
@@ -367,7 +368,6 @@ static size_t n_registered, registry_alloced;
 
 extern const YcUIFuncs yc_ui_plain;
 extern const YcUIFuncs yc_ui_prefix;
-extern const YcUIFuncs yc_ui_headless_jobs;
 extern const YcUIFuncs yc_ui_passthrough;
 extern const YcUIFuncs yc_ui_two_pane;
 
@@ -380,7 +380,6 @@ register_builtins_once (void)
   done = true;
   yc_ui_register (&yc_ui_plain);
   yc_ui_register (&yc_ui_prefix);
-  yc_ui_register (&yc_ui_headless_jobs);
   yc_ui_register (&yc_ui_passthrough);
   yc_ui_register (&yc_ui_two_pane);
 }
@@ -431,15 +430,136 @@ yc_ui_get_all (const YcUIFuncs *const **funcs_out)
   return n_registered;
 }
 
+/* --- the recorder registry --- */
+
+static const YcRecorderFuncs **recorder_registry;
+static size_t n_recorders_registered, recorder_registry_alloced;
+
+extern const YcRecorderFuncs yc_recorder_jobs;
+
+static void
+register_recorders_once (void)
+{
+  static bool done = false;
+  if (done)
+    return;
+  done = true;
+  yc_recorder_register (&yc_recorder_jobs);
+}
+
+void
+yc_recorder_register (const YcRecorderFuncs *funcs)
+{
+  size_t i;
+
+  if (funcs->name == NULL)
+    yc_die ("yc_recorder_register: a recorder needs a name");
+  if (funcs->instance_size != 0
+   && funcs->instance_size < sizeof (YcRecorder))
+    yc_die ("yc_recorder_register: %s: instance_size %u is smaller than "
+            "YcRecorder", funcs->name, (unsigned) funcs->instance_size);
+  for (i = 0; i < n_recorders_registered; i++)
+    if (strcmp (recorder_registry[i]->name, funcs->name) == 0)
+      yc_die ("yc_recorder_register: two recorders named '%s'", funcs->name);
+
+  if (n_recorders_registered == recorder_registry_alloced)
+    {
+      recorder_registry_alloced = recorder_registry_alloced == 0
+                                ? 8 : recorder_registry_alloced * 2;
+      recorder_registry = YC_RENEW (const YcRecorderFuncs *,
+                                    recorder_registry,
+                                    recorder_registry_alloced);
+    }
+  recorder_registry[n_recorders_registered++] = funcs;
+}
+
+const YcRecorderFuncs *
+yc_recorder_lookup (const char *name)
+{
+  size_t i;
+  register_recorders_once ();
+  for (i = 0; i < n_recorders_registered; i++)
+    if (strcmp (recorder_registry[i]->name, name) == 0)
+      return recorder_registry[i];
+  return NULL;
+}
+
+size_t
+yc_recorder_get_all (const YcRecorderFuncs *const **funcs_out)
+{
+  register_recorders_once ();
+  *funcs_out = recorder_registry;
+  return n_recorders_registered;
+}
+
+YcRecorder *
+yc_recorder_new (const YcRecorderFuncs *funcs,
+                 const YcUIOptions *options,
+                 char **error_message)
+{
+  size_t size = funcs->instance_size != 0
+              ? funcs->instance_size
+              : sizeof (YcRecorder);
+  YcRecorder *recorder = yc_malloc0 (size);
+
+  recorder->funcs = funcs;
+  recorder->options = options != NULL ? options : &default_options;
+
+  if (funcs->init != NULL && !funcs->init (recorder, error_message))
+    {
+      yc_free (recorder);
+      return NULL;
+    }
+  return recorder;
+}
+
+void
+yc_recorder_free (YcRecorder *recorder)
+{
+  if (recorder == NULL)
+    return;
+  if (recorder->funcs->destroy != NULL)
+    recorder->funcs->destroy (recorder);
+  yc_free (recorder);
+}
+
 /* --- lifetime --- */
 
 /* Consuming output is what makes capturing it worthwhile; deriving it
    this way means a UI cannot ask for pipes and then ignore them, or
    forget to ask and silently see nothing. */
 static bool
-ui_captures_output (const YcUIFuncs *funcs)
+funcs_consume_output (const YcUIFuncs *funcs)
 {
   return funcs->job_output != NULL || funcs->job_line != NULL;
+}
+
+/* Any consumer at all -- the ui or any recorder -- is reason enough to
+   put the child's output on a pipe. */
+static bool
+ui_captures_output (YcUI *ui)
+{
+  size_t i;
+  if (funcs_consume_output (ui->funcs))
+    return true;
+  for (i = 0; i < ui->n_recorders; i++)
+    {
+      const YcRecorderFuncs *funcs = ui->recorders[i]->funcs;
+      if (funcs->job_output != NULL || funcs->job_line != NULL)
+        return true;
+    }
+  return false;
+}
+
+void
+yc_ui_add_recorder (YcUI *ui, YcRecorder *recorder)
+{
+  if (ui->n_started > 0)
+    yc_die ("yc_ui_add_recorder: too late, jobs have already started");
+  recorder->slot = ui->n_recorders;
+  ui->recorders = YC_RENEW (YcRecorder *, ui->recorders,
+                            ui->n_recorders + 1);
+  ui->recorders[ui->n_recorders++] = recorder;
 }
 
 YcUI *
@@ -478,6 +598,12 @@ yc_ui_free (YcUI *ui)
 
   if (ui->funcs->destroy != NULL)
     ui->funcs->destroy (ui);
+  {
+    size_t i;
+    for (i = 0; i < ui->n_recorders; i++)
+      yc_recorder_free (ui->recorders[i]);
+    yc_free (ui->recorders);
+  }
   yc_free (ui->ended_jobs);
   yc_free (ui->jobs);
   yc_free (ui);
@@ -492,8 +618,13 @@ yc_ui_job_index_string (YcUI *ui, YcUIJob *job, char *buf, size_t buf_size)
 void
 yc_ui_all_done (YcUI *ui)
 {
+  size_t i;
+
   if (ui->funcs->all_done != NULL)
     ui->funcs->all_done (ui);
+  for (i = 0; i < ui->n_recorders; i++)
+    if (ui->recorders[i]->funcs->all_done != NULL)
+      ui->recorders[i]->funcs->all_done (ui->recorders[i]);
 }
 
 /* --- the job table --- */
@@ -534,6 +665,7 @@ job_free (YcUIJob *job)
     for (i = 0; i < N_CAPTURED_FDS; i++)
       yc_free (job->pending[i].data);
   yc_free (job->pending);
+  yc_free (job->recorder_data);
   yc_free ((char *) job->cmdline);
   yc_free (job);
 }
@@ -633,10 +765,36 @@ static void
 emit_line (YcUI *ui, YcUIJob *job, int child_fd,
            char *line, size_t len, uint64_t micros)
 {
+  size_t i;
+
   if (len > 0 && line[len - 1] == '\r')
     len--;
   line[len] = 0;
-  ui->funcs->job_line (ui, job, child_fd, line, len, micros);
+
+  if (ui->funcs->job_line != NULL)
+    ui->funcs->job_line (ui, job, child_fd, line, len, micros);
+  for (i = 0; i < ui->n_recorders; i++)
+    {
+      YcRecorder *recorder = ui->recorders[i];
+      if (recorder->funcs->job_line != NULL)
+        recorder->funcs->job_line (recorder, job,
+                                   job->recorder_data[recorder->slot],
+                                   child_fd, line, len, micros);
+    }
+}
+
+/* Line reassembly is only worth doing if somebody is going to be told
+   about the lines. */
+static bool
+wants_lines (YcUI *ui)
+{
+  size_t i;
+  if (ui->funcs->job_line != NULL)
+    return true;
+  for (i = 0; i < ui->n_recorders; i++)
+    if (ui->recorders[i]->funcs->job_line != NULL)
+      return true;
+  return false;
 }
 
 /* Everything goes through the pending buffer, including chunks that
@@ -677,7 +835,7 @@ static void
 flush_pending_lines (YcUI *ui, YcUIJob *job, uint64_t micros)
 {
   size_t i;
-  if (job->pending == NULL || ui->funcs->job_line == NULL)
+  if (job->pending == NULL || !wants_lines (ui))
     return;
   for (i = 0; i < N_CAPTURED_FDS; i++)
     {
@@ -703,6 +861,7 @@ ui_child_io (YcChild *child, int child_fd, int pipe_fd)
   char buf[READ_CHUNK];
   ssize_t n_read;
   uint64_t micros;
+  size_t i;
 
   if ((cfd->revents & YC_CHILD_FD_EVENT_READABLE) == 0)
     {
@@ -720,7 +879,16 @@ ui_child_io (YcChild *child, int child_fd, int pipe_fd)
       if (ui->funcs->job_output != NULL)
         ui->funcs->job_output (ui, job, child_fd, buf, (size_t) n_read,
                               micros);
-      if (ui->funcs->job_line != NULL)
+      for (i = 0; i < ui->n_recorders; i++)
+        {
+          YcRecorder *recorder = ui->recorders[i];
+          if (recorder->funcs->job_output != NULL)
+            recorder->funcs->job_output (recorder, job,
+                                         job->recorder_data[recorder->slot],
+                                         child_fd, buf, (size_t) n_read,
+                                         micros);
+        }
+      if (wants_lines (ui))
         deliver_lines (ui, job, child_fd, buf, (size_t) n_read, micros);
       return;
     }
@@ -764,6 +932,18 @@ ui_child_done (YcChild *child)
 
   if (ui->funcs->job_ended != NULL)
     ui->funcs->job_ended (ui, job);
+  {
+    size_t i;
+    for (i = 0; i < ui->n_recorders; i++)
+      {
+        YcRecorder *recorder = ui->recorders[i];
+        if (recorder->funcs->job_ended != NULL)
+          recorder->funcs->job_ended (recorder, job,
+                                      job->recorder_data[recorder->slot]);
+        /* Its state is gone now, whatever the ui does with the job. */
+        job->recorder_data[recorder->slot] = NULL;
+      }
+  }
 
   /* Nowhere to retain it, so this is also the end of its life. */
   if (ui->max_ended_jobs == 0)
@@ -788,8 +968,9 @@ yc_ui_spawn (YcUI *ui,
   YcUIJob *job;
   YcChild *child;
   int fd;
+  size_t i;
 
-  if (ui_captures_output (ui->funcs))
+  if (ui_captures_output (ui))
     for (fd = FIRST_CAPTURED_FD; fd < FIRST_CAPTURED_FD + N_CAPTURED_FDS; fd++)
       {
         /* INHERIT is the shell parser's default, i.e. "not redirected".
@@ -818,6 +999,8 @@ yc_ui_spawn (YcUI *ui,
   job->cmdline = yc_strdup (cmdline);
   job->running = true;
   job->started_micros = yc_now_micros ();
+  if (ui->n_recorders > 0)
+    job->recorder_data = YC_NEW0_ARRAY (ui->n_recorders, void *);
 
   create_info->callbacks = &ui_child_callbacks;
   create_info->user_data = job;
@@ -835,6 +1018,13 @@ yc_ui_spawn (YcUI *ui,
 
   if (ui->funcs->job_started != NULL)
     ui->funcs->job_started (ui, job);
+  for (i = 0; i < ui->n_recorders; i++)
+    {
+      YcRecorder *recorder = ui->recorders[i];
+      if (recorder->funcs->job_started != NULL)
+        job->recorder_data[recorder->slot] =
+          recorder->funcs->job_started (recorder, job);
+    }
 
   return child;
 }

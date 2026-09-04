@@ -38,6 +38,7 @@
 
 typedef struct YcUI YcUI;
 typedef struct YcUIJob YcUIJob;
+typedef struct YcRecorder YcRecorder;
 typedef struct YcUIFuncs YcUIFuncs;
 typedef struct YcUIOptions YcUIOptions;
 
@@ -172,6 +173,7 @@ struct YcUIJob {
 
   /*< private >*/
   struct YcUILineBuf *pending;    /* partial lines, per captured fd */
+  void **recorder_data;           /* one slot per attached recorder */
 };
 
 typedef enum
@@ -272,6 +274,8 @@ struct YcUI {
   /*< private >*/
   size_t jobs_alloced;
   size_t ended_jobs_alloced;
+  YcRecorder **recorders;
+  size_t n_recorders;
 };
 
 /* --- the registry --- */
@@ -338,7 +342,14 @@ YcChild *yc_ui_spawn (YcUI                *ui,
  * afterwards; walk it backwards if reaping as you go. */
 void yc_ui_reap_job (YcUI *ui, YcUIJob *job);
 
-/* Call once the container's run has finished. */
+/* Attaches a recorder, which then sees every job event alongside the
+ * UI.  Takes ownership: yc_ui_free() frees it.  Must be called before
+ * the first yc_ui_spawn(), since it is what decides whether output
+ * needs capturing.  See yc-recorder.h. */
+void yc_ui_add_recorder (YcUI *ui, YcRecorder *recorder);
+
+/* Call once the container's run has finished; reaches the recorders
+ * too. */
 void yc_ui_all_done (YcUI *ui);
 
 #endif
